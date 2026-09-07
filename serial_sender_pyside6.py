@@ -14,7 +14,7 @@ from PySide6.QtGui import QFont
 class SerialSendWindow(QDialog):
     """串口发送窗口"""
 
-    def __init__(self, parent, serial_port, baudrate, send_queue):
+     def __init__(self, parent, serial_port, baudrate, send_queue):
         """
         Args:
             parent: 父窗口

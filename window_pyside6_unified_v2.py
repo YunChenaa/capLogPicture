@@ -451,6 +451,7 @@ def serial_reader(port, baudrate, error_queue, connected_event=None, log_queue=N
                 data = ser.readline()
                 line = data.decode('utf-8', errors='ignore').rstrip()
                 line = strip_ansi_codes(line)
+                line = line.lstrip()  # 清除前导空格
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                 log = f'[{timestamp}] {line}'
                 print(log)
