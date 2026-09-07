@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QMenu
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QSize
-from PySide6.QtGui import QFont, QTextCursor, QPalette, QColor, QPixmap, QImage, QTextDocument, QShortcut, QKeySequence
+from PySide6.QtGui import QFont, QTextCursor, QPalette, QColor, QPixmap, QImage, QTextDocument, QShortcut, QKeySequence, QTransform
 
 from datetime import datetime
 from collections import deque
@@ -98,6 +98,301 @@ def _save_last_selection(data):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
+
+# ==============================
+# 自定义命令发送对话框
+# ==============================
+
+# ==============================
+# 图片查看器窗口
+# ==============================
+
+class ImageViewerDialog(QDialog):
+    """图片查看器 - 支持缩放、旋转、翻转等操作"""
+
+    def __init__(self, image_path, parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.setWindowTitle(f'图片查看器 - {os.path.basename(image_path)}')
+        self.resize(800, 600)
+
+        # 图片变换参数
+        self.zoom_scale = 1.0
+        self.rotation = 0
+        self.flip_h = False
+        self.flip_v = False
+
+        # 加载原始图片
+        print(f'[调试] 正在加载图片: {image_path}')
+        print(f'[调试] 文件是否存在: {os.path.exists(image_path)}')
+
+        self.original_pixmap = QPixmap(image_path)
+        print(f'[调试] QPixmap 加载结果: isNull={self.original_pixmap.isNull()}')
+        print(f'[调试] 原始图片尺寸: {self.original_pixmap.width()} x {self.original_pixmap.height()}')
+
+        if self.original_pixmap.isNull():
+            QMessageBox.warning(self, '错误', '无法加载图片')
+            self.reject()
+            return
+
+        self.setup_ui()
+
+        # 延迟执行适应窗口，等待窗口完全显示后
+        print(f'[调试] 将在100ms后执行 zoom_fit')
+        QTimer.singleShot(100, self.zoom_fit)
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # 工具栏
+        toolbar = QHBoxLayout()
+
+        btn_zoom_in = QPushButton('🔍+')
+        btn_zoom_in.setMaximumWidth(50)
+        btn_zoom_in.setToolTip('放大 (Ctrl++)')
+        btn_zoom_in.clicked.connect(self.zoom_in)
+        toolbar.addWidget(btn_zoom_in)
+
+        btn_zoom_out = QPushButton('🔍-')
+        btn_zoom_out.setMaximumWidth(50)
+        btn_zoom_out.setToolTip('缩小 (Ctrl+-)')
+        btn_zoom_out.clicked.connect(self.zoom_out)
+        toolbar.addWidget(btn_zoom_out)
+
+        btn_zoom_fit = QPushButton('📐')
+        btn_zoom_fit.setMaximumWidth(50)
+        btn_zoom_fit.setToolTip('适应窗口 (Ctrl+0)')
+        btn_zoom_fit.clicked.connect(self.zoom_fit)
+        toolbar.addWidget(btn_zoom_fit)
+
+        btn_zoom_100 = QPushButton('1:1')
+        btn_zoom_100.setMaximumWidth(50)
+        btn_zoom_100.setToolTip('实际大小 (Ctrl+1)')
+        btn_zoom_100.clicked.connect(self.zoom_actual)
+        toolbar.addWidget(btn_zoom_100)
+
+        toolbar.addWidget(QLabel('|'))
+
+        btn_rotate_left = QPushButton('↺')
+        btn_rotate_left.setMaximumWidth(50)
+        btn_rotate_left.setToolTip('逆时针旋转 (Ctrl+L)')
+        btn_rotate_left.clicked.connect(self.rotate_left)
+        toolbar.addWidget(btn_rotate_left)
+
+        btn_rotate_right = QPushButton('↻')
+        btn_rotate_right.setMaximumWidth(50)
+        btn_rotate_right.setToolTip('顺时针旋转 (Ctrl+R)')
+        btn_rotate_right.clicked.connect(self.rotate_right)
+        toolbar.addWidget(btn_rotate_right)
+
+        toolbar.addWidget(QLabel('|'))
+
+        btn_flip_h = QPushButton('⇄')
+        btn_flip_h.setMaximumWidth(50)
+        btn_flip_h.setToolTip('水平翻转 (Ctrl+H)')
+        btn_flip_h.clicked.connect(self.flip_horizontal)
+        toolbar.addWidget(btn_flip_h)
+
+        btn_flip_v = QPushButton('⇅')
+        btn_flip_v.setMaximumWidth(50)
+        btn_flip_v.setToolTip('垂直翻转 (Ctrl+V)')
+        btn_flip_v.clicked.connect(self.flip_vertical)
+        toolbar.addWidget(btn_flip_v)
+
+        toolbar.addWidget(QLabel('|'))
+
+        btn_reset = QPushButton('🔄 重置')
+        btn_reset.setToolTip('重置所有变换')
+        btn_reset.clicked.connect(self.reset_transforms)
+        toolbar.addWidget(btn_reset)
+
+        # 缩放比例显示
+        self.zoom_label = QLabel('100%')
+        self.zoom_label.setStyleSheet('color: #666666; font-weight: bold;')
+        self.zoom_label.setMinimumWidth(60)
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        toolbar.addWidget(self.zoom_label)
+
+        toolbar.addStretch()
+
+        # 图片信息
+        img_info = f'{self.original_pixmap.width()} × {self.original_pixmap.height()} px'
+        file_size = os.path.getsize(self.image_path) / 1024
+        info_text = f'{img_info} | {file_size:.1f} KB'
+        self.info_label = QLabel(info_text)
+        self.info_label.setStyleSheet('color: #666666; font-size: 9pt;')
+        toolbar.addWidget(self.info_label)
+
+        layout.addLayout(toolbar)
+
+        # 图片显示区域（带滚动）
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(False)  # 改回 False，这样才能滚动
+        self.scroll_area.setAlignment(Qt.AlignCenter)
+        self.scroll_area.setStyleSheet('QScrollArea { background-color: #f0f0f0; }')
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setScaledContents(False)
+        self.scroll_area.setWidget(self.image_label)
+
+        layout.addWidget(self.scroll_area)
+
+        # 底部按钮
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        btn_close = QPushButton('关闭')
+        btn_close.clicked.connect(self.accept)
+        button_layout.addWidget(btn_close)
+
+        layout.addLayout(button_layout)
+
+    def zoom_in(self):
+        """放大"""
+        print(f'[调试] zoom_in 被调用')
+        self.zoom_scale *= 1.25
+        self.update_image()
+
+    def zoom_out(self):
+        """缩小"""
+        print(f'[调试] zoom_out 被调用')
+        self.zoom_scale /= 1.25
+        if self.zoom_scale < 0.05:
+            self.zoom_scale = 0.05
+        self.update_image()
+
+    def zoom_fit(self):
+        """适应窗口"""
+        print(f'[调试] zoom_fit 被调用')
+        available_width = self.scroll_area.viewport().width() - 20
+        available_height = self.scroll_area.viewport().height() - 20
+        print(f'[调试] 可用区域大小: {available_width} x {available_height}')
+        print(f'[调试] 原始图片大小: {self.original_pixmap.width()} x {self.original_pixmap.height()}')
+
+        # 计算缩放比例
+        scale_w = available_width / self.original_pixmap.width()
+        scale_h = available_height / self.original_pixmap.height()
+        self.zoom_scale = min(scale_w, scale_h, 1.0)
+        print(f'[调试] 计算的缩放比例: scale_w={scale_w:.3f}, scale_h={scale_h:.3f}, 最终={self.zoom_scale:.3f}')
+
+        self.update_image()
+
+    def zoom_actual(self):
+        """实际大小"""
+        print(f'[调试] zoom_actual 被调用')
+        self.zoom_scale = 1.0
+        self.update_image()
+
+    def rotate_left(self):
+        """逆时针旋转"""
+        print(f'[调试] rotate_left 被调用')
+        self.rotation = (self.rotation - 90) % 360
+        print(f'[调试] 旋转角度变为: {self.rotation}')
+        self.update_image()
+
+    def rotate_right(self):
+        """顺时针旋转"""
+        print(f'[调试] rotate_right 被调用')
+        self.rotation = (self.rotation + 90) % 360
+        print(f'[调试] 旋转角度变为: {self.rotation}')
+        self.update_image()
+
+    def flip_horizontal(self):
+        """水平翻转"""
+        print(f'[调试] flip_horizontal 被调用')
+        self.flip_h = not self.flip_h
+        print(f'[调试] 水平翻转状态: {self.flip_h}')
+        self.update_image()
+
+    def flip_vertical(self):
+        """垂直翻转"""
+        print(f'[调试] flip_vertical 被调用')
+        self.flip_v = not self.flip_v
+        print(f'[调试] 垂直翻转状态: {self.flip_v}')
+        self.update_image()
+
+    def reset_transforms(self):
+        """重置所有变换"""
+        self.zoom_scale = 1.0
+        self.rotation = 0
+        self.flip_h = False
+        self.flip_v = False
+        self.update_image()
+
+    def update_image(self):
+        """更新图片显示"""
+        print(f'[调试] update_image 被调用, zoom_scale={self.zoom_scale:.3f}')
+        # 应用变换
+        pixmap = self.apply_transforms(self.original_pixmap)
+        print(f'[调试] 变换后的图片大小: {pixmap.width()} x {pixmap.height()}')
+
+        # 设置 label 的尺寸为图片的实际尺寸
+        self.image_label.setFixedSize(pixmap.size())
+        self.image_label.setPixmap(pixmap)
+        print(f'[调试] 图片已设置到 label')
+
+        # 更新缩放比例显示
+        self.zoom_label.setText(f'{int(self.zoom_scale * 100)}%')
+
+    def apply_transforms(self, pixmap):
+        """应用所有变换"""
+        if pixmap.isNull():
+            return pixmap
+
+        # 转换为 QImage
+        image = pixmap.toImage()
+
+        # 翻转
+        if self.flip_h:
+            image = image.mirrored(True, False)
+        if self.flip_v:
+            image = image.mirrored(False, True)
+
+        # 转回 QPixmap
+        transformed = QPixmap.fromImage(image)
+
+        # 旋转
+        if self.rotation != 0:
+            transform = QTransform()
+            transform.rotate(self.rotation)
+            transformed = transformed.transformed(transform, Qt.SmoothTransformation)
+
+        # 缩放（始终应用，即使是1.0）
+        new_w = int(transformed.width() * self.zoom_scale)
+        new_h = int(transformed.height() * self.zoom_scale)
+
+        # 确保尺寸至少为1像素
+        new_w = max(1, new_w)
+        new_h = max(1, new_h)
+
+        transformed = transformed.scaled(new_w, new_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        return transformed
+
+    def keyPressEvent(self, event):
+        """键盘快捷键"""
+        if event.modifiers() == Qt.ControlModifier:
+            if event.key() == Qt.Key_Plus or event.key() == Qt.Key_Equal:
+                self.zoom_in()
+            elif event.key() == Qt.Key_Minus:
+                self.zoom_out()
+            elif event.key() == Qt.Key_0:
+                self.zoom_fit()
+            elif event.key() == Qt.Key_1:
+                self.zoom_actual()
+            elif event.key() == Qt.Key_L:
+                self.rotate_left()
+            elif event.key() == Qt.Key_R:
+                self.rotate_right()
+            elif event.key() == Qt.Key_H:
+                self.flip_horizontal()
+            elif event.key() == Qt.Key_V:
+                self.flip_vertical()
+        else:
+            super().keyPressEvent(event)
 
 # ==============================
 # 自定义命令发送对话框
@@ -870,9 +1165,24 @@ class MainWindow(QMainWindow):
 
         left_layout.addWidget(log_group)
 
-        # 快速发送区
-        send_group = QGroupBox('📤 快速发送')
+        # 快速发送区（可折叠）
+        send_outer_layout = QVBoxLayout()
+
+        # 标题栏和折叠按钮
+        send_header_layout = QHBoxLayout()
+        self.btn_toggle_send = QPushButton('▼ 📤 快速发送')
+        self.btn_toggle_send.clicked.connect(self.toggle_send_group)
+        send_header_layout.addWidget(self.btn_toggle_send)
+        send_header_layout.addStretch()
+        send_outer_layout.addLayout(send_header_layout)
+
+        # 可折叠的快速发送内容区域
+        self.send_content_widget = QWidget()
+        send_group = QGroupBox()
         send_layout = QVBoxLayout(send_group)
+        self.send_content_widget.setLayout(QVBoxLayout())
+        self.send_content_widget.layout().setContentsMargins(0, 0, 0, 0)
+        self.send_content_widget.layout().addWidget(send_group)
 
         send_mode_layout = QHBoxLayout()
         self.mode_group = QButtonGroup()
@@ -892,9 +1202,27 @@ class MainWindow(QMainWindow):
         self.cb_add_newline = QCheckBox('自动换行')
         self.cb_add_newline.setChecked(True)
         send_mode_layout.addWidget(self.cb_add_newline)
+
+        # 添加快捷命令按钮
+        btn_add_shortcut = QPushButton('➕')
+        btn_add_shortcut.setMaximumWidth(30)
+        btn_add_shortcut.setToolTip('添加快捷命令')
+        btn_add_shortcut.setStyleSheet('QPushButton { font-weight: bold; padding: 2px; }')
+        btn_add_shortcut.clicked.connect(self.add_quick_command)
+        send_mode_layout.addWidget(btn_add_shortcut)
+
         send_mode_layout.addStretch()
 
         send_layout.addLayout(send_mode_layout)
+
+        # 快捷命令按钮区域
+        self.shortcut_commands_layout = QHBoxLayout()
+        self.shortcut_commands_layout.setSpacing(5)
+        send_layout.addLayout(self.shortcut_commands_layout)
+
+        # 加载保存的快捷命令
+        self.quick_commands = []
+        self.load_quick_commands()
 
         send_input_layout = QHBoxLayout()
         self.send_entry = QLineEdit()
@@ -909,7 +1237,9 @@ class MainWindow(QMainWindow):
 
         send_layout.addLayout(send_input_layout)
 
-        left_layout.addWidget(send_group)
+        # 将内容添加到外层布局
+        send_outer_layout.addWidget(self.send_content_widget)
+        left_layout.addLayout(send_outer_layout)
 
         splitter.addWidget(left_widget)
 
@@ -949,7 +1279,7 @@ class MainWindow(QMainWindow):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setMinimumWidth(400)
-        scroll_area.setMinimumHeight(300)  # 缩小到原来的一半（600->300）
+        scroll_area.setMinimumHeight(300)
 
         self.image_container = QWidget()
         self.image_layout = QVBoxLayout(self.image_container)
@@ -1824,6 +2154,181 @@ class MainWindow(QMainWindow):
             self.module_content_widget.setVisible(True)
             self.btn_toggle_module.setText('▼ 🔧 模组控制')
 
+    def toggle_send_group(self):
+        """折叠/展开快速发送区域"""
+        if self.send_content_widget.isVisible():
+            # 折叠
+            self.send_content_widget.setVisible(False)
+            self.btn_toggle_send.setText('▶ 📤 快速发送')
+        else:
+            # 展开
+            self.send_content_widget.setVisible(True)
+            self.btn_toggle_send.setText('▼ 📤 快速发送')
+
+    def load_quick_commands(self):
+        """加载快捷命令"""
+        try:
+            config = load_config()
+            self.quick_commands = config.get('quick_commands', [])
+            self.refresh_quick_command_buttons()
+        except Exception as e:
+            print(f'[调试] 加载快捷命令失败: {e}')
+            self.quick_commands = []
+
+    def save_quick_commands(self):
+        """保存快捷命令"""
+        try:
+            config = load_config()
+            config['quick_commands'] = self.quick_commands
+            save_config(config)
+        except Exception as e:
+            print(f'[调试] 保存快捷命令失败: {e}')
+
+    def add_quick_command(self):
+        """添加快捷命令"""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QMessageBox
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle('添加快捷命令')
+        dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout(dialog)
+
+        # 名称输入
+        name_layout = QHBoxLayout()
+        name_layout.addWidget(QLabel('按钮名称:'))
+        name_input = QLineEdit()
+        name_input.setPlaceholderText('例如: 复位、查询状态')
+        name_layout.addWidget(name_input)
+        layout.addLayout(name_layout)
+
+        # 命令输入
+        cmd_layout = QHBoxLayout()
+        cmd_layout.addWidget(QLabel('发送内容:'))
+        cmd_input = QLineEdit()
+        cmd_input.setPlaceholderText('例如: reset 或 AA 55 01 02')
+        cmd_layout.addWidget(cmd_input)
+        layout.addLayout(cmd_layout)
+
+        # 类型选择
+        type_layout = QHBoxLayout()
+        type_layout.addWidget(QLabel('发送类型:'))
+        type_combo = QComboBox()
+        type_combo.addItems(['文本', 'HEX', 'BIN'])
+        type_layout.addWidget(type_combo)
+        type_layout.addStretch()
+        layout.addLayout(type_layout)
+
+        # 按钮
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        btn_cancel = QPushButton('取消')
+        btn_cancel.clicked.connect(dialog.reject)
+        button_layout.addWidget(btn_cancel)
+
+        btn_save = QPushButton('保存')
+        btn_save.setStyleSheet('QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 16px; }')
+        btn_save.clicked.connect(dialog.accept)
+        button_layout.addWidget(btn_save)
+
+        layout.addLayout(button_layout)
+
+        if dialog.exec() == QDialog.Accepted:
+            name = name_input.text().strip()
+            command = cmd_input.text().strip()
+            cmd_type = type_combo.currentText()
+
+            if not name or not command:
+                QMessageBox.warning(self, '输入错误', '请输入按钮名称和发送内容！')
+                return
+
+            # 检查是否已存在同名命令
+            for cmd in self.quick_commands:
+                if cmd['name'] == name:
+                    reply = QMessageBox.question(
+                        self,
+                        '重复的命令名称',
+                        f'快捷命令 "{name}" 已存在，是否覆盖？',
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    if reply == QMessageBox.Yes:
+                        cmd['command'] = command
+                        cmd['type'] = cmd_type
+                        self.save_quick_commands()
+                        self.refresh_quick_command_buttons()
+                    return
+
+            # 添加新命令
+            self.quick_commands.append({
+                'name': name,
+                'command': command,
+                'type': cmd_type
+            })
+            self.save_quick_commands()
+            self.refresh_quick_command_buttons()
+
+    def refresh_quick_command_buttons(self):
+        """刷新快捷命令按钮"""
+        # 清除现有按钮
+        while self.shortcut_commands_layout.count():
+            item = self.shortcut_commands_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # 添加快捷命令按钮
+        for cmd in self.quick_commands:
+            btn = QPushButton(f'⚡ {cmd["name"]}')
+            btn.setStyleSheet('QPushButton { background-color: #2196F3; color: white; padding: 4px 10px; border-radius: 3px; }')
+            btn.clicked.connect(lambda checked, c=cmd: self.execute_quick_command(c))
+
+            # 右键菜单：删除
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn.customContextMenuRequested.connect(lambda pos, button=btn, command=cmd: self.show_quick_command_menu(button, command))
+
+            self.shortcut_commands_layout.addWidget(btn)
+
+        # 添加弹性空间
+        self.shortcut_commands_layout.addStretch()
+
+    def show_quick_command_menu(self, button, command):
+        """显示快捷命令右键菜单"""
+        menu = QMenu(self)
+        delete_action = menu.addAction('🗑️ 删除')
+        action = menu.exec_(button.mapToGlobal(button.rect().center()))
+
+        if action == delete_action:
+            reply = QMessageBox.question(
+                self,
+                '确认删除',
+                f'确定要删除快捷命令 "{command["name"]}" 吗？',
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.quick_commands.remove(command)
+                self.save_quick_commands()
+                self.refresh_quick_command_buttons()
+
+    def execute_quick_command(self, command):
+        """执行快捷命令"""
+        if not self.connected_event.is_set():
+            QMessageBox.warning(self, '提示', '串口未连接')
+            return
+
+        # 设置输入框内容
+        self.send_entry.setText(command['command'])
+
+        # 设置发送类型
+        if command['type'] == '文本':
+            self.rb_text.setChecked(True)
+        elif command['type'] == 'HEX':
+            self.rb_hex.setChecked(True)
+        elif command['type'] == 'BIN':
+            self.rb_binary.setChecked(True)
+
+        # 执行发送
+        self.quick_send()
+
     def open_custom_command_dialog(self):
         """打开自定义命令发送窗口"""
         print('[调试-打开对话框] open_custom_command_dialog 被调用')
@@ -2388,6 +2893,16 @@ class MainWindow(QMainWindow):
                     img_label.setAlignment(Qt.AlignCenter)
                     img_label.setStyleSheet('border: 1px solid #ddd; padding: 5px; background: white;')
 
+                    # 设置为可点击
+                    img_label.setCursor(Qt.PointingHandCursor)
+                    img_label.setToolTip('双击查看大图')
+
+                    # 保存图片路径到标签
+                    img_label.setProperty('image_path', img_path)
+
+                    # 双击事件
+                    img_label.mouseDoubleClickEvent = lambda event, path=img_path: self.open_image_viewer(path)
+
                     # 文件名
                     name_label = QLabel(os.path.basename(img_path))
                     name_label.setAlignment(Qt.AlignCenter)
@@ -2397,6 +2912,14 @@ class MainWindow(QMainWindow):
                     self.image_layout.addWidget(name_label)
             except Exception as e:
                 print(f'加载图片失败: {img_path}, {e}')
+
+    def open_image_viewer(self, image_path):
+        """打开图片查看器窗口"""
+        try:
+            viewer = ImageViewerDialog(image_path, self)
+            viewer.exec()
+        except Exception as e:
+            QMessageBox.warning(self, '错误', f'打开图片查看器失败：\n{str(e)}')
 
     def display_downloaded_images(self, image1_path, image2_path):
         """显示下载的两张图片（水平并排）"""
