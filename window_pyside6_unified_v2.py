@@ -2859,7 +2859,7 @@ class MainWindow(QMainWindow):
         self.image_info_label.setText(f'路径: {folder_path}\n检测时间: {self.current_image_data.timestamp.strftime("%Y-%m-%d %H:%M:%S")}')
 
     def display_images(self, folder_path):
-        """显示图片"""
+        """显示图片（水平排列）"""
         # 清空之前的图片
         while self.image_layout.count():
             item = self.image_layout.takeAt(0)
@@ -2880,13 +2880,18 @@ class MainWindow(QMainWindow):
             self.image_layout.addWidget(label)
             return
 
-        # 显示图片
-        for img_path in image_files[:10]:  # 最多显示10张
+        # 创建水平布局容器
+        h_layout = QHBoxLayout()
+        h_layout.setSpacing(10)
+        h_layout.setAlignment(Qt.AlignCenter)
+
+        # 显示图片（最多10张，水平排列）
+        for img_path in image_files[:10]:
             try:
                 pixmap = QPixmap(img_path)
                 if not pixmap.isNull():
                     # 缩放图片
-                    scaled_pixmap = pixmap.scaled(350, 350, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    scaled_pixmap = pixmap.scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
                     img_label = QLabel()
                     img_label.setPixmap(scaled_pixmap)
@@ -2903,15 +2908,27 @@ class MainWindow(QMainWindow):
                     # 双击事件
                     img_label.mouseDoubleClickEvent = lambda event, path=img_path: self.open_image_viewer(path)
 
+                    # 创建垂直容器（图片+文件名）
+                    v_container = QWidget()
+                    v_layout = QVBoxLayout(v_container)
+                    v_layout.setContentsMargins(0, 0, 0, 0)
+                    v_layout.addWidget(img_label)
+
                     # 文件名
                     name_label = QLabel(os.path.basename(img_path))
                     name_label.setAlignment(Qt.AlignCenter)
                     name_label.setStyleSheet('color: #666666; font-size: 9pt;')
+                    v_layout.addWidget(name_label)
 
-                    self.image_layout.addWidget(img_label)
-                    self.image_layout.addWidget(name_label)
+                    h_layout.addWidget(v_container)
             except Exception as e:
                 print(f'加载图片失败: {img_path}, {e}')
+
+        # 添加水平布局到主布局
+        h_layout.addStretch()
+        h_container = QWidget()
+        h_container.setLayout(h_layout)
+        self.image_layout.addWidget(h_container)
 
     def open_image_viewer(self, image_path):
         """打开图片查看器窗口"""
