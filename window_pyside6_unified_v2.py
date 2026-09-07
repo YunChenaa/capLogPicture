@@ -122,6 +122,13 @@ class ImageViewerDialog(QDialog):
         self.flip_h = False
         self.flip_v = False
 
+        # 矩形框参数
+        self.draw_rect = False
+        self.rect_left = 0
+        self.rect_top = 0
+        self.rect_right = 0
+        self.rect_bottom = 0
+
         # 加载原始图片
         print(f'[调试] 正在加载图片: {image_path}')
         print(f'[调试] 文件是否存在: {os.path.exists(image_path)}')
@@ -240,6 +247,66 @@ class ImageViewerDialog(QDialog):
 
         layout.addWidget(self.scroll_area)
 
+        # 矩形框绘制区域
+        rect_group = QGroupBox('📦 绘制矩形框')
+        rect_main_layout = QVBoxLayout(rect_group)
+
+        # 第一行：智能输入框
+        smart_input_layout = QHBoxLayout()
+        smart_input_layout.addWidget(QLabel('快速输入:'))
+        self.smart_rect_input = QLineEdit()
+        self.smart_rect_input.setPlaceholderText('例如: [50, 100, 300, 400] 或 50, 100, 300, 400')
+        self.smart_rect_input.returnPressed.connect(self.parse_smart_input)
+        smart_input_layout.addWidget(self.smart_rect_input)
+
+        btn_parse = QPushButton('📋 解析')
+        btn_parse.setToolTip('从输入框解析坐标并填充到下方')
+        btn_parse.clicked.connect(self.parse_smart_input)
+        smart_input_layout.addWidget(btn_parse)
+
+        rect_main_layout.addLayout(smart_input_layout)
+
+        # 第二行：详细输入框
+        rect_layout = QHBoxLayout()
+
+        rect_layout.addWidget(QLabel('Left:'))
+        self.rect_left_input = QLineEdit()
+        self.rect_left_input.setMaximumWidth(60)
+        self.rect_left_input.setPlaceholderText('0')
+        rect_layout.addWidget(self.rect_left_input)
+
+        rect_layout.addWidget(QLabel('Top:'))
+        self.rect_top_input = QLineEdit()
+        self.rect_top_input.setMaximumWidth(60)
+        self.rect_top_input.setPlaceholderText('0')
+        rect_layout.addWidget(self.rect_top_input)
+
+        rect_layout.addWidget(QLabel('Right:'))
+        self.rect_right_input = QLineEdit()
+        self.rect_right_input.setMaximumWidth(60)
+        self.rect_right_input.setPlaceholderText('0')
+        rect_layout.addWidget(self.rect_right_input)
+
+        rect_layout.addWidget(QLabel('Bottom:'))
+        self.rect_bottom_input = QLineEdit()
+        self.rect_bottom_input.setMaximumWidth(60)
+        self.rect_bottom_input.setPlaceholderText('0')
+        rect_layout.addWidget(self.rect_bottom_input)
+
+        btn_draw_rect = QPushButton('✏️ 绘制')
+        btn_draw_rect.clicked.connect(self.draw_rectangle)
+        rect_layout.addWidget(btn_draw_rect)
+
+        btn_clear_rect = QPushButton('🗑️ 清除')
+        btn_clear_rect.clicked.connect(self.clear_rectangle)
+        rect_layout.addWidget(btn_clear_rect)
+
+        rect_layout.addStretch()
+
+        rect_main_layout.addLayout(rect_layout)
+
+        layout.addWidget(rect_group)
+
         # 底部按钮
         button_layout = QHBoxLayout()
         button_layout.addStretch()
@@ -322,6 +389,84 @@ class ImageViewerDialog(QDialog):
         self.flip_v = False
         self.update_image()
 
+    def parse_smart_input(self):
+        """解析智能输入框，提取四个数字并填充到详细输入框"""
+        text = self.smart_rect_input.text().strip()
+        if not text:
+            return
+
+        try:
+            # 移除方括号
+            text = text.replace('[', '').replace(']', '')
+            # 按逗号分割
+            parts = [p.strip() for p in text.split(',')]
+
+            if len(parts) != 4:
+                QMessageBox.warning(self, '解析错误', f'需要4个数字，但找到了 {len(parts)} 个\n格式: [left, top, right, bottom]')
+                return
+
+            # 转换为整数
+            left = int(parts[0])
+            top = int(parts[1])
+            right = int(parts[2])
+            bottom = int(parts[3])
+
+            # 填充到详细输入框
+            self.rect_left_input.setText(str(left))
+            self.rect_top_input.setText(str(top))
+            self.rect_right_input.setText(str(right))
+            self.rect_bottom_input.setText(str(bottom))
+
+            print(f'[调试] 智能解析成功: left={left}, top={top}, right={right}, bottom={bottom}')
+
+            # 自动绘制
+            self.draw_rectangle()
+
+        except ValueError as e:
+            QMessageBox.warning(self, '解析错误', f'无法解析数字：{str(e)}\n请确保输入格式正确，例如: [50, 100, 300, 400]')
+
+    def draw_rectangle(self):
+        """绘制矩形框"""
+        try:
+            left = int(self.rect_left_input.text() or 0)
+            top = int(self.rect_top_input.text() or 0)
+            right = int(self.rect_right_input.text() or 0)
+            bottom = int(self.rect_bottom_input.text() or 0)
+
+            # 验证输入
+            if left < 0 or top < 0 or right < 0 or bottom < 0:
+                QMessageBox.warning(self, '输入错误', '坐标值不能为负数')
+                return
+
+            if right <= left or bottom <= top:
+                QMessageBox.warning(self, '输入错误', 'Right 必须大于 Left，Bottom 必须大于 Top')
+                return
+
+            # 保存矩形框参数
+            self.draw_rect = True
+            self.rect_left = left
+            self.rect_top = top
+            self.rect_right = right
+            self.rect_bottom = bottom
+
+            print(f'[调试] 绘制矩形框: left={left}, top={top}, right={right}, bottom={bottom}')
+
+            # 更新图片显示
+            self.update_image()
+
+        except ValueError:
+            QMessageBox.warning(self, '输入错误', '请输入有效的数字')
+
+    def clear_rectangle(self):
+        """清除矩形框"""
+        self.draw_rect = False
+        self.rect_left_input.clear()
+        self.rect_top_input.clear()
+        self.rect_right_input.clear()
+        self.rect_bottom_input.clear()
+        print(f'[调试] 清除矩形框')
+        self.update_image()
+
     def update_image(self):
         """更新图片显示"""
         print(f'[调试] update_image 被调用, zoom_scale={self.zoom_scale:.3f}')
@@ -359,6 +504,23 @@ class ImageViewerDialog(QDialog):
             transform = QTransform()
             transform.rotate(self.rotation)
             transformed = transformed.transformed(transform, Qt.SmoothTransformation)
+
+        # 绘制矩形框（在缩放之前）
+        if self.draw_rect:
+            from PySide6.QtGui import QPainter, QPen
+            from PySide6.QtCore import QRect
+
+            painter = QPainter(transformed)
+            pen = QPen(QColor(255, 0, 0))  # 红色
+            pen.setWidth(2)
+            painter.setPen(pen)
+
+            # 绘制矩形
+            rect = QRect(self.rect_left, self.rect_top,
+                        self.rect_right - self.rect_left,
+                        self.rect_bottom - self.rect_top)
+            painter.drawRect(rect)
+            painter.end()
 
         # 缩放（始终应用，即使是1.0）
         new_w = int(transformed.width() * self.zoom_scale)
