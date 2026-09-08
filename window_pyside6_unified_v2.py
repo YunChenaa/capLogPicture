@@ -396,20 +396,30 @@ class ImageViewerDialog(QDialog):
             return
 
         try:
-            # 移除方括号
-            text = text.replace('[', '').replace(']', '')
-            # 按逗号分割
-            parts = [p.strip() for p in text.split(',')]
+            # 使用正则表达式提取所有数字（支持负数）
+            import re
+            numbers = re.findall(r'-?\d+', text)
 
-            if len(parts) != 4:
-                QMessageBox.warning(self, '解析错误', f'需要4个数字，但找到了 {len(parts)} 个\n格式: [left, top, right, bottom]')
+            if len(numbers) < 4:
+                QMessageBox.warning(self, '解析错误', f'需要4个数字，但只找到了 {len(numbers)} 个\n示例格式:\n- [left, top, right, bottom]\n- rgb:[386 232 122 99]\n- left:117 top:386 right:280 bottom:548')
                 return
 
-            # 转换为整数
-            left = int(parts[0])
-            top = int(parts[1])
-            right = int(parts[2])
-            bottom = int(parts[3])
+            if len(numbers) > 4:
+                # 如果找到超过4个数字，提示用户并使用前4个
+                reply = QMessageBox.question(
+                    self,
+                    '多个数字',
+                    f'找到了 {len(numbers)} 个数字: {numbers}\n是否使用前4个数字？',
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    return
+
+            # 转换为整数（使用前4个）
+            left = int(numbers[0])
+            top = int(numbers[1])
+            right = int(numbers[2])
+            bottom = int(numbers[3])
 
             # 填充到详细输入框
             self.rect_left_input.setText(str(left))
@@ -423,7 +433,9 @@ class ImageViewerDialog(QDialog):
             self.draw_rectangle()
 
         except ValueError as e:
-            QMessageBox.warning(self, '解析错误', f'无法解析数字：{str(e)}\n请确保输入格式正确，例如: [50, 100, 300, 400]')
+            QMessageBox.warning(self, '解析错误', f'无法解析数字：{str(e)}')
+        except Exception as e:
+            QMessageBox.warning(self, '解析错误', f'解析失败：{str(e)}')
 
     def draw_rectangle(self):
         """绘制矩形框"""
