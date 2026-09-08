@@ -1113,6 +1113,7 @@ class MainWindow(QMainWindow):
         self.last_upload_command = b''  # 最后一次上传指令（用于重传）
         self.retry_timer = None  # 重传定时器
         self.download_type = 'jpeg'  # 下载类型：'jpeg' 或 'raw'
+        self.raw_mode = 'Y+IR'  # RAW图模式：'Y+RGB'(40%+60%) 或 'Y+IR'(50%+50%)
 
         # 重复执行相关
         self.repeat_mode = False  # 是否处于重复执行模式
@@ -1499,6 +1500,27 @@ class MainWindow(QMainWindow):
         mode_layout.addWidget(self.palm_mode_radio)
 
         mode_layout.addStretch()
+
+        # RAW图模式选择
+        mode_layout.addWidget(QLabel('RAW模式:'))
+
+        self.raw_mode_button_group = QButtonGroup(self)
+
+        self.raw_y_rgb_radio = QRadioButton('Y+RGB')
+        self.raw_y_rgb_radio.setToolTip('第一张图40%，第二张图60%')
+        self.raw_mode_button_group.addButton(self.raw_y_rgb_radio)
+        mode_layout.addWidget(self.raw_y_rgb_radio)
+
+        self.raw_y_ir_radio = QRadioButton('Y+IR')
+        self.raw_y_ir_radio.setChecked(True)  # 默认选中Y+IR
+        self.raw_y_ir_radio.setToolTip('第一张图50%，第二张图50%')
+        self.raw_mode_button_group.addButton(self.raw_y_ir_radio)
+        mode_layout.addWidget(self.raw_y_ir_radio)
+
+        # 连接信号
+        self.raw_y_rgb_radio.toggled.connect(self.on_raw_mode_changed)
+
+        mode_layout.addWidget(QLabel('  '))  # 添加一点间距
 
         # 添加重复次数输入
         mode_layout.addWidget(QLabel('重复次数:'))
@@ -2035,6 +2057,14 @@ class MainWindow(QMainWindow):
         else:
             self.port_combo.addItem('无可用串口')
         self.port_combo.blockSignals(False)
+
+    def on_raw_mode_changed(self, checked):
+        """RAW模式切换"""
+        if checked:
+            self.raw_mode = 'Y+RGB'
+        else:
+            self.raw_mode = 'Y+IR'
+        print(f'[调试] RAW模式切换为: {self.raw_mode}')
 
     def connect_serial(self):
         """连接/断开串口"""
@@ -4451,12 +4481,21 @@ class MainWindow(QMainWindow):
                 # payload是4个字节：表示两张图片的总大小
                 if len(payload) >= 4:
                     total_size = int.from_bytes(payload[:4], byteorder='big')
-                    # 各50%：第一张灰度图，第二张NV12
-                    self.image1_size = total_size // 2
-                    self.image2_size = total_size - self.image1_size
+                    # 根据RAW模式计算两张图的大小
+                    if self.raw_mode == 'Y+RGB':
+                        # Y+RGB模式：第一张图40%，第二张图60%
+                        self.image1_size = int(total_size * 0.4)
+                        self.image2_size = total_size - self.image1_size
+                        mode_desc = 'Y+RGB模式(40%+60%)'
+                    else:  # Y+IR
+                        # Y+IR模式：各50%
+                        self.image1_size = total_size // 2
+                        self.image2_size = total_size - self.image1_size
+                        mode_desc = 'Y+IR模式(50%+50%)'
+
                     self.append_module_log(
-                        f'获取RAW图大小成功：总大小 {total_size} 字节，'
-                        f'灰度图(50%) {self.image1_size} 字节，NV12(50%) {self.image2_size} 字节 {elapsed_time}',
+                        f'获取RAW图大小成功 [{mode_desc}]：总大小 {total_size} 字节，'
+                        f'第一张 {self.image1_size} 字节，第二张 {self.image2_size} 字节 {elapsed_time}',
                         success=True
                     )
                     # 开始下载图片
