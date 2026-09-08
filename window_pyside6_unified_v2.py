@@ -4230,7 +4230,7 @@ class MainWindow(QMainWindow):
                 response = self.module_response_queue.get_nowait()
 
                 # 调试打印
-                print(f'[调试-响应] 收到响应: {response}')
+                # print(f'[调试-响应] 收到响应: {response}')
 
                 if response[0] == 'error':
                     error_msg = response[1].decode('utf-8', errors='ignore')
