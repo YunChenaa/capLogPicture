@@ -645,7 +645,7 @@ class CustomCommandDialog(QDialog):
         # 清空日志按钮
         clear_layout = QHBoxLayout()
         self.btn_clear_log = QPushButton('🗑️ 清空日志')
-        self.btn_clear_log.clicked.connect(lambda: self.output_text.clear())
+        self.btn_clear_log.clicked.connect(self.clear_all_logs)
         clear_layout.addWidget(self.btn_clear_log)
         clear_layout.addStretch()
         output_layout.addLayout(clear_layout)
@@ -672,6 +672,51 @@ class CustomCommandDialog(QDialog):
             save_config(config)
         except Exception as e:
             print(f'[调试] 保存快捷命令失败: {e}')
+
+    def clear_all_logs(self):
+        """真正清空所有日志缓存"""
+        global log_cache, full_log_cache
+
+        print(f'[调试] 清空前 - log_cache长度: {len(log_cache)}, full_log_cache长度: {len(full_log_cache)}')
+
+        # 清空显示窗口
+        self.output_text.clear()
+        print(f'[调试] 已清空显示窗口')
+
+        # 清空所有日志缓存
+        log_cache.clear()
+        full_log_cache.clear()
+
+        print(f'[调试] 清空后 - log_cache长度: {len(log_cache)}, full_log_cache长度: {len(full_log_cache)}')
+
+        # 更新日志行数显示
+        self.log_count_label.setText('日志行数: 0')
+        print(f'[调试] 已更新日志行数显示为0')
+
+        print('[调试] 已清空所有日志缓存')
+
+    def clear_module_logs(self):
+        """清空模组响应日志缓存"""
+        global module_log_cache, full_log_cache, log_cache
+
+        print(f'[调试] 清空前 - module_log_cache长度: {len(module_log_cache)}, full_log_cache长度: {len(full_log_cache)}, log_cache长度: {len(log_cache)}')
+
+        # 清空显示窗口
+        self.log_text.clear()
+        print(f'[调试] 已清空模组日志显示窗口')
+
+        # 清空所有日志缓存
+        module_log_cache.clear()
+        full_log_cache.clear()
+        log_cache.clear()
+
+        print(f'[调试] 清空后 - module_log_cache长度: {len(module_log_cache)}, full_log_cache长度: {len(full_log_cache)}, log_cache长度: {len(log_cache)}')
+
+        # 更新日志行数显示为0
+        self.log_count_label.setText('日志行数: 0')
+        print(f'[调试] 已更新模组日志行数显示为0')
+
+        print('[调试] 已清空所有日志缓存')
 
     def add_shortcut_command(self):
         """添加快捷命令"""
@@ -1327,7 +1372,7 @@ class MainWindow(QMainWindow):
         log_tool_layout = QHBoxLayout()
 
         btn_clear = QPushButton('🗑️ 清空')
-        btn_clear.clicked.connect(self.log_text.clear)
+        btn_clear.clicked.connect(self.clear_module_logs)
         log_tool_layout.addWidget(btn_clear)
 
         log_tool_layout.addStretch()
@@ -1799,9 +1844,20 @@ class MainWindow(QMainWindow):
         self.more_commands_widget.setVisible(False)
 
         # 响应显示区域
+        # 响应信息标题和清除按钮
+        response_header_layout = QHBoxLayout()
         response_label = QLabel('响应信息:')
         response_label.setStyleSheet('font-weight: bold; margin-top: 10px;')
-        module_layout.addWidget(response_label)
+        response_header_layout.addWidget(response_label)
+
+        btn_clear_response = QPushButton('🗑️ 清空')
+        btn_clear_response.setMaximumWidth(80)
+        btn_clear_response.setToolTip('清空响应信息')
+        btn_clear_response.clicked.connect(self.clear_module_response)
+        response_header_layout.addWidget(btn_clear_response)
+
+        response_header_layout.addStretch()
+        module_layout.addLayout(response_header_layout)
 
         self.module_response_text = QTextEdit()
         self.module_response_text.setReadOnly(True)
@@ -2069,6 +2125,34 @@ class MainWindow(QMainWindow):
         else:
             self.port_combo.addItem('无可用串口')
         self.port_combo.blockSignals(False)
+
+    def clear_module_logs(self):
+        """清空模组响应日志缓存"""
+        global module_log_cache, full_log_cache, log_cache
+
+        print(f'[调试] 清空前 - module_log_cache长度: {len(module_log_cache)}, full_log_cache长度: {len(full_log_cache)}, log_cache长度: {len(log_cache)}')
+
+        # 清空显示窗口
+        self.log_text.clear()
+        print(f'[调试] 已清空模组日志显示窗口')
+
+        # 清空所有日志缓存
+        module_log_cache.clear()
+        full_log_cache.clear()
+        log_cache.clear()
+
+        print(f'[调试] 清空后 - module_log_cache长度: {len(module_log_cache)}, full_log_cache长度: {len(full_log_cache)}, log_cache长度: {len(log_cache)}')
+
+        # 更新日志行数显示为0
+        self.log_count_label.setText('日志行数: 0')
+        print(f'[调试] 已更新模组日志行数显示为0')
+
+        print('[调试] 已清空所有日志缓存')
+
+    def clear_module_response(self):
+        """清空模组响应信息显示"""
+        self.module_response_text.clear()
+        print('[调试] 已清空模组响应信息显示')
 
     def on_raw_mode_changed(self, checked):
         """RAW模式切换"""
@@ -3751,8 +3835,14 @@ class MainWindow(QMainWindow):
                 color: #e0e0e0;
             }
             QScrollArea {
-                background-color: #2b2b2b;
+                background-color: #1e1e1e;
                 border: 1px solid #555555;
+            }
+            QScrollArea > QWidget > QWidget {
+                background-color: #1e1e1e;
+            }
+            QScrollArea QLabel {
+                background-color: transparent;
             }
             QComboBox::drop-down {
                 border: none;
