@@ -1591,9 +1591,11 @@ class MainWindow(QMainWindow):
 
         module_layout.addLayout(mode_layout)
 
+        # 第二行：项目模式和停止条件
+        second_row_layout = QHBoxLayout()
+
         # 项目模式选择（DSM/KDS）
-        project_mode_layout = QHBoxLayout()
-        project_mode_layout.addWidget(QLabel('项目模式:'))
+        second_row_layout.addWidget(QLabel('项目模式:'))
 
         # 创建DSM/KDS项目模式按钮组
         self.project_button_group = QButtonGroup(self)
@@ -1601,14 +1603,37 @@ class MainWindow(QMainWindow):
         self.dsm_mode_radio = QRadioButton('DSM')
         self.dsm_mode_radio.setChecked(True)  # 默认选中DSM模式
         self.project_button_group.addButton(self.dsm_mode_radio)
-        project_mode_layout.addWidget(self.dsm_mode_radio)
+        second_row_layout.addWidget(self.dsm_mode_radio)
 
         self.kds_mode_radio = QRadioButton('KDS')
         self.project_button_group.addButton(self.kds_mode_radio)
-        project_mode_layout.addWidget(self.kds_mode_radio)
+        second_row_layout.addWidget(self.kds_mode_radio)
 
-        project_mode_layout.addStretch()
-        module_layout.addLayout(project_mode_layout)
+        second_row_layout.addWidget(QLabel('  '))  # 添加一点间距
+
+        # 停止条件选择
+        second_row_layout.addWidget(QLabel('停止条件:'))
+
+        self.stop_condition_button_group = QButtonGroup(self)
+
+        self.stop_none_radio = QRadioButton('不停止')
+        self.stop_none_radio.setChecked(True)  # 默认不停止
+        self.stop_none_radio.setToolTip('执行完所有重复次数')
+        self.stop_condition_button_group.addButton(self.stop_none_radio)
+        second_row_layout.addWidget(self.stop_none_radio)
+
+        self.stop_on_fail_radio = QRadioButton('失败停止')
+        self.stop_on_fail_radio.setToolTip('当某次注册或识别失败时，自动停止重复执行')
+        self.stop_condition_button_group.addButton(self.stop_on_fail_radio)
+        second_row_layout.addWidget(self.stop_on_fail_radio)
+
+        self.stop_on_success_radio = QRadioButton('成功停止')
+        self.stop_on_success_radio.setToolTip('当某次注册或识别成功时，自动停止重复执行')
+        self.stop_condition_button_group.addButton(self.stop_on_success_radio)
+        second_row_layout.addWidget(self.stop_on_success_radio)
+
+        second_row_layout.addStretch()
+        module_layout.addLayout(second_row_layout)
 
         # 分隔线
         line_mode = QFrame()
@@ -2386,8 +2411,12 @@ class MainWindow(QMainWindow):
             self.save_content_widget.setVisible(True)
             self.btn_toggle_save.setText('▼ 折叠')
 
-    def check_repeat_next(self):
-        """检查是否需要继续重复执行下一次"""
+    def check_repeat_next(self, last_success=None):
+        """检查是否需要继续重复执行下一次
+
+        Args:
+            last_success: 上次操作是否成功。True=成功, False=失败, None=未知
+        """
         if not self.repeat_mode:
             return
 
@@ -2397,6 +2426,35 @@ class MainWindow(QMainWindow):
 
         # 标记当前操作已收到Reply
         self.repeat_reply_received = True
+
+        # 检查是否需要根据成功/失败条件停止
+        should_stop = False
+        stop_reason = ''
+
+        if last_success is True and self.stop_on_success_radio.isChecked():
+            should_stop = True
+            stop_reason = '检测到成功，触发成功停止'
+        elif last_success is False and self.stop_on_fail_radio.isChecked():
+            should_stop = True
+            stop_reason = '检测到失败，触发失败停止'
+
+        if should_stop:
+            # 提前停止，计算成功率
+            success_rate = (self.repeat_success_count / self.repeat_current * 100) if self.repeat_current > 0 else 0
+            self.append_module_log(
+                f'[重复执行] {stop_reason}，已执行 {self.repeat_current}/{self.repeat_total} 次，'
+                f'成功 {self.repeat_success_count} 次，'
+                f'成功率 {success_rate:.2f}%',
+                success=(last_success is True)
+            )
+            # 重置重复模式
+            self.repeat_mode = False
+            self.repeat_current = 0
+            self.repeat_total = 1
+            self.repeat_command = None
+            self.repeat_success_count = 0
+            self.repeat_reply_received = False
+            return
 
         # 检查是否还有剩余次数
         if self.repeat_current < self.repeat_total:
@@ -4425,6 +4483,9 @@ class MainWindow(QMainWindow):
                 # 统计成功次数
                 if self.repeat_mode:
                     self.repeat_success_count += 1
+
+                # 检查是否需要继续重复执行（传递成功状态）
+                self.check_repeat_next(last_success=True)
             else:
                 error_messages = {
                     0x01: '模组拒绝此命令',
@@ -4438,8 +4499,8 @@ class MainWindow(QMainWindow):
                 error_msg = error_messages.get(result, f'未知错误 (0x{result:02X})')
                 self.append_module_log(f'注册失败: {error_msg} {elapsed_time}', error=True)
 
-            # 检查是否需要继续重复执行
-            self.check_repeat_next()
+                # 检查是否需要继续重复执行（传递失败状态）
+                self.check_repeat_next(last_success=False)
 
         elif msg_id == '0x12':  # 人脸识别
             if result == 0x00:
@@ -4453,8 +4514,12 @@ class MainWindow(QMainWindow):
                 # 统计成功次数
                 if self.repeat_mode:
                     self.repeat_success_count += 1
+
+                # 检查是否需要继续重复执行（传递成功状态）
+                self.check_repeat_next(last_success=True)
             elif result == 0x23:
                 self.append_module_log(f'palm switch {elapsed_time}', success=True)
+                # palm switch不触发重复逻辑
             else:
                 error_messages = {
                     0x01: '模组拒绝此命令',
@@ -4473,9 +4538,8 @@ class MainWindow(QMainWindow):
                 error_msg = error_messages.get(result, f'未知错误 (0x{result:02X})')
                 self.append_module_log(f'识别失败: {error_msg} {elapsed_time}', error=True)
 
-            # 检查是否需要继续重复执行
-            if result != 0x23:
-                self.check_repeat_next()
+                # 检查是否需要继续重复执行（传递失败状态）
+                self.check_repeat_next(last_success=False)
 
         elif msg_id == '0x51':  # 设置波特率
             # 添加调试信息
@@ -4634,6 +4698,9 @@ class MainWindow(QMainWindow):
                 # 统计成功次数
                 if self.repeat_mode:
                     self.repeat_success_count += 1
+
+                # 检查是否需要继续重复执行（传递成功状态）
+                self.check_repeat_next(last_success=True)
             else:
                 # 注册失败（错误码从十进制转换为十六进制）
                 error_messages = {
@@ -4646,8 +4713,8 @@ class MainWindow(QMainWindow):
                 error_msg = error_messages.get(result, f'未知错误 (0x{result:02X})')
                 self.append_module_log(f'手掌注册失败: {error_msg} {elapsed_time}', error=True)
 
-            # 检查是否需要继续重复执行
-            self.check_repeat_next()
+                # 检查是否需要继续重复执行（传递失败状态）
+                self.check_repeat_next(last_success=False)
 
         elif msg_id == '0x63':  # 手掌识别
             if result == 0x00:
@@ -4666,14 +4733,18 @@ class MainWindow(QMainWindow):
                         success=True
                     )
                 else:
-                    
+
                     self.append_module_log(f'手掌识别成功 {elapsed_time}', success=True)
 
                 # 统计成功次数
                 if self.repeat_mode:
                     self.repeat_success_count += 1
+
+                # 检查是否需要继续重复执行（传递成功状态）
+                self.check_repeat_next(last_success=True)
             elif result == 0x23:
                 self.append_module_log(f'palm switch {elapsed_time}', success=True)
+                # palm switch不触发重复逻辑
             else:
                 # 识别失败（错误码从十进制转换为十六进制）
                 error_messages = {
@@ -4698,9 +4769,8 @@ class MainWindow(QMainWindow):
                 error_msg = error_messages.get(result, f'未知错误 (0x{result:02X})')
                 self.append_module_log(f'手掌识别失败: {error_msg} {elapsed_time}', error=True)
 
-            # 检查是否需要继续重复执行
-            if result != 0x23:
-                self.check_repeat_next()
+                # 检查是否需要继续重复执行（传递失败状态）
+                self.check_repeat_next(last_success=False)
 
         elif msg_id == '0x64':  # 手掌获取已注册用户列表
             if result == 0x00:
