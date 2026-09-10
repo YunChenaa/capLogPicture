@@ -1171,6 +1171,9 @@ class MainWindow(QMainWindow):
         self.retry_timer = None  # 重传定时器
         self.download_type = 'jpeg'  # 下载类型：'jpeg' 或 'raw'
         self.raw_mode = 'Y+IR'  # RAW图模式：'Y+RGB'(40%+60%) 或 'Y+IR'(50%+50%)
+        self.next_request_sent = False  # 标记是否已提前发送下一个请求
+        self.pending_command = None  # 等待响应的指令（msg_id, retry_count）
+        self.command_timeout_timer = None  # 指令超时定时器
 
         # 重复执行相关
         self.repeat_mode = False  # 是否处于重复执行模式
@@ -4311,18 +4314,18 @@ class MainWindow(QMainWindow):
             print(f'[模组] 断开连接失败: {e}')
 
     def module_receive_worker(self):
-        """模组串口接收线程（优化版）"""
+        """模组串口接收线程（优化版 - 使用阻塞读取）"""
+        # 设置读取超时为500ms，避免永久阻塞
+        if self.module_serial:
+            self.module_serial.timeout = 0.5
+
         while self.module_connected and self.module_serial:
             try:
-                # 等待至少有 6 字节数据（同步头2 + 消息类型1 + 长度2 + 校验和1）
-                if self.module_serial.in_waiting < 6:
-                    time.sleep(0.001)  # 减少到 1ms
-                    continue
-
-                # 一次性读取头部（同步头 + 消息类型 + 数据长度）
+                # 阻塞读取头部5字节（同步头2 + 消息类型1 + 长度2）
+                # pyserial会在有数据时立即返回，或超时后返回实际读到的字节
                 header = self.module_serial.read(5)
                 if len(header) < 5:
-                    continue
+                    continue  # 超时或数据不完整，重新读取
 
                 sync = header[0:2]
                 if sync != b'\xEF\xAA':
@@ -4332,21 +4335,16 @@ class MainWindow(QMainWindow):
                 data_size_bytes = header[3:5]
                 data_size = int.from_bytes(data_size_bytes, byteorder='big')
 
-                # 等待数据和校验和到达（优化：避免读取不完整）
-                wait_count = 0
-                while self.module_serial.in_waiting < data_size + 1 and wait_count < 100:
-                    time.sleep(0.001)
-                    wait_count += 1
-
-                # 一次性读取数据和校验和
+                # 阻塞读取数据和校验和（data_size + 1字节）
+                # 不需要手动轮询in_waiting，read()会高效等待数据到达
                 tail = self.module_serial.read(data_size + 1)
                 if len(tail) < data_size + 1:
-                    continue
+                    continue  # 数据不完整，重新读取
 
                 data = tail[0:data_size]
                 checksum = tail[data_size:data_size + 1]
 
-                # 快速校验和计算（优化：减少循环开销）
+                # 快速校验和计算
                 calc_checksum = msg_type[0] ^ data_size_bytes[0] ^ data_size_bytes[1]
                 for b in data:
                     calc_checksum ^= b
@@ -4360,7 +4358,7 @@ class MainWindow(QMainWindow):
                     raw_packet = sync + msg_type + data_size_bytes + data + checksum
                     self.custom_command_data_signal.emit(raw_packet)
 
-                # 根据消息类型处理（优化：减少打印）
+                # 根据消息类型处理
                 msg_type_val = msg_type[0]
                 if msg_type_val == 0x00:  # Reply消息
                     if data_size >= 1:
@@ -4372,7 +4370,7 @@ class MainWindow(QMainWindow):
                 elif msg_type_val == 0x01:  # Note消息
                     self.module_response_queue.put(('note', data))
 
-                elif msg_type_val == 0x02:  # 图片数据消息（优化：直接放入队列，减少打印）
+                elif msg_type_val == 0x02:  # 图片数据消息
                     self.module_response_queue.put(('image_data', data_size, data))
 
                 else:
@@ -4389,26 +4387,26 @@ class MainWindow(QMainWindow):
             while not self.module_response_queue.empty():
                 response = self.module_response_queue.get_nowait()
 
-                # 调试打印
-                # print(f'[调试-响应] 收到响应: {response}')
-
                 if response[0] == 'error':
                     error_msg = response[1].decode('utf-8', errors='ignore')
                     self.append_module_log(f'[错误] {error_msg}', error=True)
                 elif response[0] == 'reply':
                     # Reply消息: ('reply', msg_id, result, payload)
                     _, msg_id, result, payload = response
-                    print(f'[调试-Reply] msg_id=0x{msg_id:02X}, result=0x{result:02X}, payload长度={len(payload)}')
+                    # 优化：下载期间减少打印
+                    if not self.is_downloading or msg_id not in [0x18, 0x51]:
+                        print(f'[调试-Reply] msg_id=0x{msg_id:02X}, result=0x{result:02X}, payload长度={len(payload)}')
                     self.module_response_signal.emit(f'0x{msg_id:02X}', ('reply', result, payload))
                 elif response[0] == 'note':
                     # Note消息: ('note', data)
                     _, data = response
-                    print(f'[调试-Note] data长度={len(data)}, 前4字节={data[:4].hex().upper() if len(data) >= 4 else data.hex().upper()}')
+                    # if not self.is_downloading:
+                    #     print(f'[调试-Note] data长度={len(data)}, 前4字节={data[:4].hex().upper() if len(data) >= 4 else data.hex().upper()}')
                     self.module_response_signal.emit('note', ('note', 0, data))
                 elif response[0] == 'image_data':
                     # 图片数据消息: ('image_data', data_size, img_data)
+                    # 优化：下载期间不打印每个包的接收信息
                     _, data_size, img_data = response
-                    print(f'[调试-图片数据] 接收到 {data_size} 字节')
                     self.handle_image_data(data_size, img_data)
         except queue.Empty:
             pass
@@ -4418,7 +4416,7 @@ class MainWindow(QMainWindow):
         msg_type, result, payload = data
 
         # 调试打印
-        print(f'[调试-处理响应] msg_id={msg_id}, msg_type={msg_type}, result={result if msg_type == "reply" else "N/A"}')
+        # print(f'[调试-处理响应] msg_id={msg_id}, msg_type={msg_type}, result={result if msg_type == "reply" else "N/A"}')
 
         # 处理Note消息
         if msg_id == 'note':
@@ -4428,6 +4426,21 @@ class MainWindow(QMainWindow):
         # 处理Reply消息
         if msg_type != 'reply':
             return
+
+        # 清除超时定时器（收到响应说明指令成功）
+        if self.command_timeout_timer and self.command_timeout_timer.isActive():
+            self.command_timeout_timer.stop()
+
+        # 清除待响应指令记录
+        if self.pending_command:
+            pending_msg_id = self.pending_command[0]
+            # 检查响应的msg_id是否匹配待响应的指令
+            try:
+                current_msg_id = int(msg_id, 16)
+                if current_msg_id == pending_msg_id:
+                    self.pending_command = None
+            except:
+                pass
 
         # 计算时长
         elapsed_time = self.get_command_elapsed_time(msg_id)
@@ -4594,17 +4607,10 @@ class MainWindow(QMainWindow):
                             self.module_serial.baudrate = baudrate
                             print(f'[调试-0x51] 串口波特率切换成功')
                             self.append_module_log(f'串口波特率已切换到 {baudrate}')
-                            # 步骤2: 根据下载类型发送获取图片大小指令
-                            if self.download_type == 'raw':
-                                self.append_module_log('[步骤2] 发送获取RAW图大小指令')
-                                print(f'[调试-0x51] 准备发送0x15指令')
-                                self.send_module_command(0x15)
-                                print(f'[调试-0x51] 已发送0x15指令')
-                            else:  # jpeg
-                                self.append_module_log('[步骤2] 发送获取JPEG大小指令')
-                                print(f'[调试-0x51] 准备发送0x14指令')
-                                self.send_module_command(0x14)
-                                print(f'[调试-0x51] 已发送0x14指令')
+
+                            # 延迟30ms后再发送下一个指令，等待模组稳定
+                            QTimer.singleShot(30, self.send_get_image_size_command)
+
                         except Exception as e:
                             print(f'[调试-0x51] 切换波特率异常: {e}')
                             self.append_module_log(f'[错误] 切换波特率失败: {e}', error=True)
@@ -4980,14 +4986,14 @@ class MainWindow(QMainWindow):
                     1: '未检测到人脸',
                     2: '人脸太靠上，请向下移动',
                     3: '人脸太靠下，请向上移动',
-                    4: '人脸太靠左，请向右移动',
-                    5: '人脸太靠右，请向左移动',
+                    4: '人脸太靠右，请向左移动',
+                    5: '人脸太靠左，请向右移动',
                     6: '人脸太远，请靠近',
                     7: '人脸太近，请远离',
                     8: '眉毛遮挡/检测到多人',
                     9: '眼睛遮挡',
                     10: '脸部遮挡',
-                    11: '录入人脸方向错误',
+                    11: '人脸方向错误',
                     12: '闭眼模式检测到睁眼/非活体',
                     13: '闭眼状态',
                     14: '闭眼模式无法判断睁眼闭眼',
@@ -5051,7 +5057,7 @@ class MainWindow(QMainWindow):
                 }
 
                 status_msg = palm_status_messages.get(status, f'未知错误 (0x{status:02X})')
-                self.append_module_log(f'[DSM手掌状态] {status_msg}')
+                self.append_module_log(f'[手掌状态] {status_msg}')
 
             elif nid == 0x08:  # 手掌Note消息（KDS模式）
                 # 第1字节是0x05，第2字节是状态信息
@@ -5156,15 +5162,74 @@ class MainWindow(QMainWindow):
             # 记录当前命令类型（用于Note消息识别）
             self.current_command_type = msg_id
 
+            # 为关键指令启动超时重传定时器（0x14获取JPEG大小、0x15获取RAW大小、0x51设置波特率）
+            if msg_id in [0x14, 0x15, 0x51]:
+                # 停止之前的超时定时器
+                if self.command_timeout_timer:
+                    self.command_timeout_timer.stop()
+
+                # 记录待响应的指令
+                if not self.pending_command or self.pending_command[0] != msg_id:
+                    self.pending_command = (msg_id, data, 0)  # (msg_id, data, retry_count)
+
+                # 启动超时定时器（5秒超时）
+                self.command_timeout_timer = QTimer()
+                self.command_timeout_timer.setSingleShot(True)
+                self.command_timeout_timer.timeout.connect(self.on_command_timeout)
+                self.command_timeout_timer.start(5000)
+
             # 记录日志
-            hex_str = ' '.join(f'{b:02X}' for b in message)
-            self.append_module_log(f'[发送] {hex_str}')
+            # hex_str = ' '.join(f'{b:02X}' for b in message)
+            # self.append_module_log(f'[发送] {msg_id_byte}')
 
             return True
 
         except Exception as e:
             QMessageBox.critical(self, '发送失败', f'发送指令失败:\n{e}')
             return False
+
+    def on_command_timeout(self):
+        """指令超时处理"""
+        if not self.pending_command:
+            return
+
+        msg_id, data, retry_count = self.pending_command
+
+        # 最多重试3次
+        if retry_count < 3:
+            retry_count += 1
+            self.pending_command = (msg_id, data, retry_count)
+
+            msg_name_map = {
+                0x14: '获取JPEG大小',
+                0x15: '获取RAW大小',
+                0x51: '设置波特率'
+            }
+            msg_name = msg_name_map.get(msg_id, f'0x{msg_id:02X}')
+
+            self.append_module_log(f'[超时重传] {msg_name}指令无响应，第{retry_count}次重试...', error=True)
+            print(f'[调试-超时] 指令0x{msg_id:02X}超时，重试次数={retry_count}')
+
+            # 重新发送指令
+            self.send_module_command(msg_id, data)
+        else:
+            # 重试次数用尽
+            msg_name_map = {
+                0x14: '获取JPEG大小',
+                0x15: '获取RAW大小',
+                0x51: '设置波特率'
+            }
+            msg_name = msg_name_map.get(msg_id, f'0x{msg_id:02X}')
+
+            self.append_module_log(f'[错误] {msg_name}指令重试3次后仍无响应，请检查模组连接', error=True)
+            self.pending_command = None
+
+            # 清理下载状态
+            if msg_id in [0x14, 0x15]:
+                self.is_downloading = False
+                self.download_buffer = bytearray()
+                self.download_offset = 0
+                self.download_total_size = 0
 
     def get_module_version(self):
         """获取模组版本号"""
@@ -5428,7 +5493,43 @@ class MainWindow(QMainWindow):
 
     def standby_module(self):
         """待机模组"""
-        # 发送待机指令：0x10
+        # 先恢复波特率到115200并停止当前所有操作
+        if self.module_serial and self.module_serial.baudrate != 115200:
+            try:
+                self.append_module_log('[待机] 正在恢复波特率到115200...')
+                # 发送0x51指令设置波特率为115200
+                self.send_module_command(0x51, b'\x01')  # 0x01 = 115200
+                # 立即停止所有下载操作
+                self.is_downloading = False
+                if self.retry_timer:
+                    self.retry_timer.stop()
+                if self.command_timeout_timer:
+                    self.command_timeout_timer.stop()
+                # 切换串口波特率
+                self.module_serial.baudrate = 115200
+                self.append_module_log('[待机] 波特率已恢复到115200')
+            except Exception as e:
+                self.append_module_log(f'[警告] 恢复波特率失败: {e}', error=True)
+
+        # 停止所有重复循环操作
+        if self.repeat_mode:
+            self.append_module_log('[待机] 停止重复执行...')
+            self.repeat_mode = False
+            self.repeat_current = 0
+            self.repeat_total = 1
+            self.repeat_command = None
+            self.repeat_success_count = 0
+            self.repeat_reply_received = False
+            # 更新UI
+            if hasattr(self, 'btn_stop_repeat'):
+                self.btn_stop_repeat.setEnabled(False)
+
+        # 延迟10ms后发送待机指令
+        self.append_module_log('[待机] 准备发送待机指令...')
+        QTimer.singleShot(10, self._send_standby_command)
+
+    def _send_standby_command(self):
+        """延迟发送待机指令"""
         self.send_module_command(0x10)
         self.append_module_log('[待机] 已发送待机指令，等待响应...')
 
@@ -5456,6 +5557,20 @@ class MainWindow(QMainWindow):
         self.send_module_command(0xF0, b'\x00')
         self.append_module_log('[Debug模式] 已发送退出Debug模式指令，等待响应...')
 
+    def send_get_image_size_command(self):
+        """发送获取图片大小指令（在波特率切换后延迟调用）"""
+        # 步骤2: 根据下载类型发送获取图片大小指令
+        if self.download_type == 'raw':
+            self.append_module_log('发送获取RAW图大小指令')
+            print(f'[调试-0x51] 准备发送0x15指令')
+            self.send_module_command(0x15)
+            print(f'[调试-0x51] 已发送0x15指令')
+        else:  # jpeg
+            self.append_module_log('发送获取JPEG大小指令')
+            print(f'[调试-0x51] 准备发送0x14指令')
+            self.send_module_command(0x14)
+            print(f'[调试-0x51] 已发送0x14指令')
+
     def download_image(self):
         """下载JPEG图片（完整流程）"""
         if self.is_downloading:
@@ -5477,7 +5592,7 @@ class MainWindow(QMainWindow):
         self.append_module_log('[下载JPEG] 开始下载流程...')
 
         # 步骤1: 设置高速波特率 1500000
-        self.append_module_log('[步骤1] 设置波特率为 1500000')
+        self.append_module_log('设置波特率为 1500000')
         self.send_module_command(0x51, b'\x04')  # 0x04 = 1500000
 
     def download_raw_image(self):
@@ -5501,7 +5616,7 @@ class MainWindow(QMainWindow):
         self.append_module_log('[下载RAW] 开始下载流程...')
 
         # 步骤1: 设置高速波特率 1500000
-        self.append_module_log('[步骤1] 设置波特率为 1500000')
+        self.append_module_log('设置波特率为 1500000')
         self.send_module_command(0x51, b'\x04')  # 0x04 = 1500000
 
     def start_image_download(self):
@@ -5512,7 +5627,13 @@ class MainWindow(QMainWindow):
         self.download_total_size = self.image1_size + self.image2_size
         self.is_downloading = True
 
-        self.append_module_log(f'[步骤3] 开始下载图片数据，总大小 {self.download_total_size} 字节')
+        # 性能分析：记录开始时间
+        self.download_start_time = time.time()
+        self.last_packet_time = time.time()
+        self.packet_count = 0
+
+        self.append_module_log(f'开始下载图片数据，总大小 {self.download_total_size} 字节')
+        # print(f'[性能] 开始下载，时间戳: {self.download_start_time}')
 
         # 发送第一个上传请求
         self.send_image_upload_request(0, min(4000, self.download_total_size))
@@ -5564,23 +5685,52 @@ class MainWindow(QMainWindow):
         if not self.is_downloading:
             return
 
+        # 重置提前请求标志，允许下次提前发送
+        self.next_request_sent = False
+
+        # 性能分析：记录包接收时间
+        current_time = time.time()
+        if hasattr(self, 'last_packet_time'):
+            packet_interval = (current_time - self.last_packet_time) * 1000  # 转换为毫秒
+            self.packet_count += 1
+
+            # 每10包打印一次性能统计
+            # if self.packet_count % 10 == 0:
+            #     print(f'[性能] 包#{self.packet_count}, 间隔: {packet_interval:.1f}ms, 已下载: {self.download_offset}/{self.download_total_size}')
+
+        self.last_packet_time = current_time
+
         # 停止重传定时器（收到数据说明传输成功）
         if self.retry_timer:
             self.retry_timer.stop()
 
         # 将接收到的数据追加到缓冲区
+        t1 = time.time()
         self.download_buffer.extend(img_data)
         self.download_offset += data_size
+        t2 = time.time()
 
-        # 显示进度
+        # 每50包打印一次数据拼接耗时
+        # if self.packet_count % 50 == 0:
+        #     print(f'[性能] 数据拼接耗时: {(t2-t1)*1000:.2f}ms')
+
+        # 优化：只在每10包或下载完成时更新进度显示（减少GUI刷新）
         progress = (self.download_offset / self.download_total_size) * 100
-        self.append_module_log(f'[下载进度] {self.download_offset}/{self.download_total_size} ({progress:.1f}%)')
+        packet_count = self.download_offset // 4000
+        if packet_count % 10 == 0 or self.download_offset >= self.download_total_size:
+            self.append_module_log(f'[下载进度] {self.download_offset}/{self.download_total_size} ({progress:.1f}%)')
 
         # 检查是否下载完成
         if self.download_offset >= self.download_total_size:
+            # 性能分析：计算总耗时
+            total_time = time.time() - self.download_start_time
+            speed_kbps = (self.download_total_size / 1024) / total_time
+            # print(f'[性能] 下载完成！总耗时: {total_time:.2f}秒, 平均速度: {speed_kbps:.2f} KB/s, 总包数: {self.packet_count}')
+            # print(f'[性能] 平均包间隔: {(total_time / self.packet_count * 1000):.1f}ms')
+
             self.finish_image_download()
-        else:
-            # 继续下载下一个数据包
+        # 如果提前请求没有发送（可能因为时序问题），则在这里发送
+        elif not self.next_request_sent:
             remaining = self.download_total_size - self.download_offset
             next_size = min(4000, remaining)
             self.send_image_upload_request(self.download_offset, next_size)
@@ -5694,7 +5844,7 @@ class MainWindow(QMainWindow):
                 self.update_history_combo()
 
             # 步骤4: 恢复标准波特率 115200
-            self.append_module_log('[步骤4] 恢复波特率为 115200')
+            self.append_module_log('恢复波特率为 115200')
 
             # 重置下载状态（在发送恢复波特率指令之前）
             self.is_downloading = False
