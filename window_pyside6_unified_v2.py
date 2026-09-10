@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QTextEdit, QComboBox, QLineEdit, QCheckBox,
     QRadioButton, QButtonGroup, QTabWidget, QMessageBox, QFileDialog,
     QDialog, QGroupBox, QFrame, QSplitter, QScrollArea, QSpinBox, QInputDialog,
-    QGridLayout, QMenu
+    QGridLayout, QMenu, QListWidget
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QSize
 from PySide6.QtGui import QFont, QTextCursor, QPalette, QColor, QPixmap, QImage, QTextDocument, QShortcut, QKeySequence, QTransform
@@ -1183,6 +1183,14 @@ class MainWindow(QMainWindow):
         self.repeat_success_count = 0  # 成功次数统计
         self.repeat_reply_received = False  # 当前操作是否已收到Reply（防止多次Reply触发）
 
+        # 自动执行序列相关
+        self.sequence_list = []  # 操作序列列表
+        self.sequence_running = False  # 是否正在执行序列
+        self.sequence_index = 0  # 当前执行到的索引
+        self.sequence_wait_response = None  # 等待响应的操作类型
+        self.sequence_current_loop = 0  # 当前循环次数
+        self.sequence_total_loops = 1  # 总循环次数
+
         # 文件监控相关
         self.download_dir = None
         self.output_base = None
@@ -1900,6 +1908,118 @@ class MainWindow(QMainWindow):
         module_outer_layout.addWidget(self.module_content_widget)
         right_layout.addLayout(module_outer_layout)
 
+        # === 自动执行序列区域 ===
+        sequence_group = QGroupBox('🔄 自动执行序列')
+        sequence_outer_layout = QVBoxLayout(sequence_group)
+
+        # 添加折叠/展开按钮
+        sequence_header_layout = QHBoxLayout()
+        self.btn_toggle_sequence = QPushButton('▼ 折叠')
+        self.btn_toggle_sequence.setMaximumWidth(80)
+        self.btn_toggle_sequence.clicked.connect(self.toggle_sequence_panel)
+        sequence_header_layout.addWidget(self.btn_toggle_sequence)
+        sequence_header_layout.addStretch()
+        sequence_outer_layout.addLayout(sequence_header_layout)
+
+        # 序列内容容器
+        self.sequence_content_widget = QWidget()
+        sequence_layout = QVBoxLayout(self.sequence_content_widget)
+        sequence_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 操作选择和添加
+        add_layout = QHBoxLayout()
+        add_layout.addWidget(QLabel('选择操作:'))
+        self.sequence_operation_combo = QComboBox()
+        self.sequence_operation_combo.addItems([
+            '人脸注册', '手掌注册', '识别D', '识别K',
+            '下载JPEG', '下载RAW', '获取版本号', '获取所有用户ID',
+            '删除指定用户ID', '删除所有用户', '重启模组', '待机',
+            '进入演示', '退出演示', '进入Debug', '退出Debug'
+        ])
+        add_layout.addWidget(self.sequence_operation_combo)
+
+        btn_add_operation = QPushButton('➕ 添加')
+        btn_add_operation.clicked.connect(self.add_sequence_operation)
+        add_layout.addWidget(btn_add_operation)
+        sequence_layout.addLayout(add_layout)
+
+        # 序列列表
+        self.sequence_list_widget = QListWidget()
+        self.sequence_list_widget.setMaximumHeight(150)
+        sequence_layout.addWidget(self.sequence_list_widget)
+
+        # 管理按钮
+        manage_layout = QHBoxLayout()
+        btn_move_up = QPushButton('⬆️ 上移')
+        btn_move_up.clicked.connect(self.move_sequence_up)
+        manage_layout.addWidget(btn_move_up)
+
+        btn_move_down = QPushButton('⬇️ 下移')
+        btn_move_down.clicked.connect(self.move_sequence_down)
+        manage_layout.addWidget(btn_move_down)
+
+        btn_delete = QPushButton('❌ 删除')
+        btn_delete.clicked.connect(self.delete_sequence_operation)
+        manage_layout.addWidget(btn_delete)
+        sequence_layout.addLayout(manage_layout)
+
+        # 循环次数设置
+        loop_layout = QHBoxLayout()
+        loop_layout.addWidget(QLabel('循环次数:'))
+        self.sequence_loop_spin = QSpinBox()
+        self.sequence_loop_spin.setMinimum(1)
+        self.sequence_loop_spin.setMaximum(1000)
+        self.sequence_loop_spin.setValue(1)
+        self.sequence_loop_spin.setFixedWidth(80)
+        self.sequence_loop_spin.setToolTip('设置序列循环执行的次数')
+        loop_layout.addWidget(self.sequence_loop_spin)
+        loop_layout.addStretch()
+        sequence_layout.addLayout(loop_layout)
+
+        # 执行控制按钮
+        control_layout = QHBoxLayout()
+        self.btn_start_sequence = QPushButton('▶️ 启动序列')
+        self.btn_start_sequence.clicked.connect(self.start_sequence)
+        self.btn_start_sequence.setStyleSheet('''
+            QPushButton {
+                padding: 10px;
+                font-size: 10pt;
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        ''')
+        control_layout.addWidget(self.btn_start_sequence)
+
+        self.btn_stop_sequence = QPushButton('⏹️ 停止序列')
+        self.btn_stop_sequence.clicked.connect(self.stop_sequence)
+        self.btn_stop_sequence.setEnabled(False)
+        self.btn_stop_sequence.setStyleSheet('''
+            QPushButton {
+                padding: 10px;
+                font-size: 10pt;
+            }
+            QPushButton:enabled {
+                background-color: #f44336;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        ''')
+        control_layout.addWidget(self.btn_stop_sequence)
+        sequence_layout.addLayout(control_layout)
+
+        # 将序列内容添加到外层布局
+        sequence_outer_layout.addWidget(self.sequence_content_widget)
+        right_layout.addWidget(sequence_group)
+
         # === 保存控制区域 ===
         save_group = QGroupBox('💾 保存控制')
         save_layout = QVBoxLayout(save_group)
@@ -2413,6 +2533,17 @@ class MainWindow(QMainWindow):
             # 展开
             self.save_content_widget.setVisible(True)
             self.btn_toggle_save.setText('▼ 折叠')
+
+    def toggle_sequence_panel(self):
+        """折叠/展开自动执行序列面板"""
+        if self.sequence_content_widget.isVisible():
+            # 折叠
+            self.sequence_content_widget.setVisible(False)
+            self.btn_toggle_sequence.setText('▶ 展开')
+        else:
+            # 展开
+            self.sequence_content_widget.setVisible(True)
+            self.btn_toggle_sequence.setText('▼ 折叠')
 
     def check_repeat_next(self, last_success=None):
         """检查是否需要继续重复执行下一次
@@ -4448,12 +4579,15 @@ class MainWindow(QMainWindow):
         if msg_id == '0x30':  # 获取版本号
             if result == 0x00:
                 # 成功，解析版本号
-                
+
                 version = payload[:-1].decode('utf-8', errors='ignore').rstrip('\x00')
                 self.append_module_log(f'[版本号] {version} {elapsed_time}', success=True)
-            
+                # 检查是否需要执行序列的下一步
+                self.check_sequence_next('获取版本号')
+
             else:
                 self.append_module_log(f'[错误] 获取版本号失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+                self.check_sequence_next('获取版本号')
 
         elif msg_id == '0x24':  # 获取所有用户ID
             if result == 0x00:
@@ -4483,6 +4617,8 @@ class MainWindow(QMainWindow):
                     self.append_module_log(f'[错误] 用户ID数据格式错误，缺少用户数量字段 {elapsed_time}', error=True)
             else:
                 self.append_module_log(f'[错误] 获取用户ID失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+            # 检查是否需要执行序列的下一步
+            self.check_sequence_next('获取所有用户ID')
 
         elif msg_id == '0x1D':  # 单帧注册
             if result == 0x00:
@@ -4499,6 +4635,9 @@ class MainWindow(QMainWindow):
 
                 # 检查是否需要继续重复执行（传递成功状态）
                 self.check_repeat_next(last_success=True)
+
+                # 检查是否需要执行序列的下一步
+                self.check_sequence_next('人脸注册')
             else:
                 error_messages = {
                     0x01: '模组拒绝此命令',
@@ -4515,6 +4654,9 @@ class MainWindow(QMainWindow):
                 # 检查是否需要继续重复执行（传递失败状态）
                 self.check_repeat_next(last_success=False)
 
+                # 注册失败也触发序列下一步（可根据需求修改）
+                self.check_sequence_next('人脸注册')
+
         elif msg_id == '0x12':  # 人脸识别
             if result == 0x00:
                 # 识别成功，解析用户ID（紧跟result后面的2字节）
@@ -4530,6 +4672,9 @@ class MainWindow(QMainWindow):
 
                 # 检查是否需要继续重复执行（传递成功状态）
                 self.check_repeat_next(last_success=True)
+
+                # 检查是否需要执行序列的下一步
+                self.check_sequence_next('识别D')
             elif result == 0x23:
                 self.append_module_log(f'palm switch {elapsed_time}', success=True)
                 # palm switch不触发重复逻辑
@@ -4553,6 +4698,9 @@ class MainWindow(QMainWindow):
 
                 # 检查是否需要继续重复执行（传递失败状态）
                 self.check_repeat_next(last_success=False)
+
+                # 识别失败也触发序列下一步
+                self.check_sequence_next('识别D')
 
         elif msg_id == '0x51':  # 设置波特率
             # 添加调试信息
@@ -4620,6 +4768,12 @@ class MainWindow(QMainWindow):
                         self.module_serial.baudrate = baudrate
                         self.append_module_log(f'串口波特率已恢复到 {baudrate}')
                         self.append_module_log('[完成] 图片下载流程完成！', success=True)
+
+                        # 检查是否需要执行序列的下一步
+                        if self.download_type == 'jpeg':
+                            self.check_sequence_next('下载JPEG')
+                        elif self.download_type == 'raw':
+                            self.check_sequence_next('下载RAW')
                     else:
                         print(f'[调试-0x51] 波特率={baudrate}, 不执行切换逻辑')
                 else:
@@ -4707,6 +4861,9 @@ class MainWindow(QMainWindow):
 
                 # 检查是否需要继续重复执行（传递成功状态）
                 self.check_repeat_next(last_success=True)
+
+                # 检查是否需要执行序列的下一步
+                self.check_sequence_next('手掌注册')
             else:
                 # 注册失败（错误码从十进制转换为十六进制）
                 error_messages = {
@@ -4721,6 +4878,9 @@ class MainWindow(QMainWindow):
 
                 # 检查是否需要继续重复执行（传递失败状态）
                 self.check_repeat_next(last_success=False)
+
+                # 注册失败也触发序列下一步
+                self.check_sequence_next('手掌注册')
 
         elif msg_id == '0x63':  # 手掌识别
             if result == 0x00:
@@ -4748,6 +4908,9 @@ class MainWindow(QMainWindow):
 
                 # 检查是否需要继续重复执行（传递成功状态）
                 self.check_repeat_next(last_success=True)
+
+                # 检查是否需要执行序列的下一步
+                self.check_sequence_next('识别K')
             elif result == 0x23:
                 self.append_module_log(f'palm switch {elapsed_time}', success=True)
                 # palm switch不触发重复逻辑
@@ -4777,6 +4940,9 @@ class MainWindow(QMainWindow):
 
                 # 检查是否需要继续重复执行（传递失败状态）
                 self.check_repeat_next(last_success=False)
+
+                # 识别失败也触发序列下一步
+                self.check_sequence_next('识别K')
 
         elif msg_id == '0x64':  # 手掌获取已注册用户列表
             if result == 0x00:
@@ -4817,36 +4983,50 @@ class MainWindow(QMainWindow):
                 self.append_module_log(f'[人脸模式] 删除用户成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[人脸模式] 删除用户失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+            # 检查是否需要执行序列的下一步
+            self.check_sequence_next('删除指定用户ID')
 
         elif msg_id == '0x21':  # 人脸删除所有用户
             if result == 0x00:
                 self.append_module_log(f'[人脸模式] 删除所有用户成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[人脸模式] 删除所有用户失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+            # 检查是否需要执行序列的下一步
+            self.check_sequence_next('删除所有用户')
 
         elif msg_id == '0x65':  # 手掌删除指定用户ID
             if result == 0x00:
                 self.append_module_log(f'[手掌模式] 删除用户成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[手掌模式] 删除用户失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+            # 检查是否需要执行序列的下一步
+            self.check_sequence_next('删除指定用户ID')
 
         elif msg_id == '0x66':  # 手掌删除所有用户
             if result == 0x00:
                 self.append_module_log(f'[手掌模式] 删除所有用户成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[手掌模式] 删除所有用户失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+            # 检查是否需要执行序列的下一步
+            self.check_sequence_next('删除所有用户')
 
         elif msg_id == '0x55':  # 重启模组
             if result == 0x00:
                 self.append_module_log(f'[重启模组] 重启成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[重启模组] 重启失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+            # 检查是否需要执行序列的下一步
+            self.check_sequence_next('重启模组')
 
         elif msg_id == '0x10':  # 待机
             if result == 0x00:
                 self.append_module_log(f'[待机] 待机成功 {elapsed_time}', success=True)
+                # 检查是否需要执行序列的下一步
+                self.check_sequence_next('待机')
             else:
                 self.append_module_log(f'[待机] 待机失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+                # 失败也触发下一步
+                self.check_sequence_next('待机')
 
         elif msg_id == '0x80':  # KDS手掌注册
             if result == 0x00:
@@ -4953,12 +5133,18 @@ class MainWindow(QMainWindow):
                 self.append_module_log(f'[演示模式] 操作成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[演示模式] 操作失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+            # 检查是否需要执行序列的下一步（进入演示和退出演示都使用同一个msg_id）
+            self.check_sequence_next('进入演示')
+            self.check_sequence_next('退出演示')
 
         elif msg_id == '0xF0':  # Debug模式
             if result == 0x00:
                 self.append_module_log(f'[Debug模式] 操作成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[Debug模式] 操作失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+            # 检查是否需要执行序列的下一步（进入Debug和退出Debug都使用同一个msg_id）
+            self.check_sequence_next('进入Debug')
+            self.check_sequence_next('退出Debug')
 
     def handle_note_message(self, data):
         """处理Note消息"""
@@ -5887,6 +6073,154 @@ class MainWindow(QMainWindow):
         cursor.insertText(log + '\n')
 
         self.module_response_text.moveCursor(QTextCursor.End)
+
+    # === 自动执行序列相关方法 ===
+    def add_sequence_operation(self):
+        """添加操作到序列"""
+        operation = self.sequence_operation_combo.currentText()
+        self.sequence_list.append(operation)
+        self.sequence_list_widget.addItem(operation)
+        self.append_module_log(f'[序列] 已添加操作: {operation}')
+
+    def move_sequence_up(self):
+        """上移序列中的操作"""
+        current_row = self.sequence_list_widget.currentRow()
+        if current_row > 0:
+            # 交换列表中的元素
+            self.sequence_list[current_row], self.sequence_list[current_row - 1] = \
+                self.sequence_list[current_row - 1], self.sequence_list[current_row]
+
+            # 更新显示
+            item = self.sequence_list_widget.takeItem(current_row)
+            self.sequence_list_widget.insertItem(current_row - 1, item)
+            self.sequence_list_widget.setCurrentRow(current_row - 1)
+
+    def move_sequence_down(self):
+        """下移序列中的操作"""
+        current_row = self.sequence_list_widget.currentRow()
+        if current_row < self.sequence_list_widget.count() - 1 and current_row >= 0:
+            # 交换列表中的元素
+            self.sequence_list[current_row], self.sequence_list[current_row + 1] = \
+                self.sequence_list[current_row + 1], self.sequence_list[current_row]
+
+            # 更新显示
+            item = self.sequence_list_widget.takeItem(current_row)
+            self.sequence_list_widget.insertItem(current_row + 1, item)
+            self.sequence_list_widget.setCurrentRow(current_row + 1)
+
+    def delete_sequence_operation(self):
+        """删除序列中的操作"""
+        current_row = self.sequence_list_widget.currentRow()
+        if current_row >= 0:
+            operation = self.sequence_list[current_row]
+            del self.sequence_list[current_row]
+            self.sequence_list_widget.takeItem(current_row)
+            self.append_module_log(f'[序列] 已删除操作: {operation}')
+
+    def start_sequence(self):
+        """启动自动执行序列"""
+        if not self.sequence_list:
+            self.append_module_log('[序列] 序列为空，请先添加操作', error=True)
+            return
+
+        if not self.module_connected:
+            self.append_module_log('[序列] 请先连接模组', error=True)
+            return
+
+        self.sequence_running = True
+        self.sequence_index = 0
+        self.sequence_current_loop = 1
+        self.sequence_total_loops = self.sequence_loop_spin.value()
+        self.btn_start_sequence.setEnabled(False)
+        self.btn_stop_sequence.setEnabled(True)
+
+        self.append_module_log(f'[序列] 开始执行序列，共 {len(self.sequence_list)} 个操作，循环 {self.sequence_total_loops} 次')
+        self.execute_next_sequence_step()
+
+    def stop_sequence(self):
+        """停止自动执行序列"""
+        if self.sequence_running:
+            self.sequence_running = False
+            self.sequence_wait_response = None
+            self.btn_start_sequence.setEnabled(True)
+            self.btn_stop_sequence.setEnabled(False)
+            self.append_module_log(f'[序列] 已停止执行序列（已完成 {self.sequence_current_loop - 1}/{self.sequence_total_loops} 次循环）', error=True)
+
+    def execute_next_sequence_step(self):
+        """执行序列中的下一步操作"""
+        if not self.sequence_running:
+            return
+
+        # 检查当前序列是否执行完成
+        if self.sequence_index >= len(self.sequence_list):
+            # 当前循环完成，检查是否需要继续下一轮循环
+            if self.sequence_current_loop < self.sequence_total_loops:
+                self.sequence_current_loop += 1
+                self.sequence_index = 0
+                self.append_module_log(f'[序列] 第 {self.sequence_current_loop - 1} 轮循环完成，开始第 {self.sequence_current_loop} 轮循环', success=True)
+                # 延迟200ms后开始下一轮循环
+                QTimer.singleShot(200, self.execute_next_sequence_step)
+                return
+            else:
+                # 所有循环完成
+                self.sequence_running = False
+                self.btn_start_sequence.setEnabled(True)
+                self.btn_stop_sequence.setEnabled(False)
+                self.append_module_log(f'[序列] 序列执行完成，共完成 {self.sequence_total_loops} 轮循环', success=True)
+                return
+
+        operation = self.sequence_list[self.sequence_index]
+        self.append_module_log(f'[序列] 第 {self.sequence_current_loop}/{self.sequence_total_loops} 轮，执行第 {self.sequence_index + 1}/{len(self.sequence_list)} 步: {operation}')
+
+        # 设置等待响应标记
+        self.sequence_wait_response = operation
+
+        # 执行对应的操作
+        if operation == '人脸注册':
+            self.register_single_frame()
+        elif operation == '手掌注册':
+            self.palm_register()
+        elif operation == '识别D':
+            self.face_recognition()
+        elif operation == '识别K':
+            self.palm_recognition()
+        elif operation == '下载JPEG':
+            self.download_image()
+        elif operation == '下载RAW':
+            self.download_raw_image()
+        elif operation == '获取版本号':
+            self.get_module_version()
+        elif operation == '获取所有用户ID':
+            self.get_all_user_ids()
+        elif operation == '删除指定用户ID':
+            self.delete_user_by_id()
+        elif operation == '删除所有用户':
+            self.delete_all_users()
+        elif operation == '重启模组':
+            self.restart_module()
+        elif operation == '待机':
+            self.standby_module()
+        elif operation == '进入演示':
+            self.enter_demo_mode()
+        elif operation == '退出演示':
+            self.exit_demo_mode()
+        elif operation == '进入Debug':
+            self.enter_debug_mode()
+        elif operation == '退出Debug':
+            self.exit_debug_mode()
+
+        self.sequence_index += 1
+
+    def check_sequence_next(self, operation_type):
+        """检查是否需要执行序列的下一步
+
+        Args:
+            operation_type: 完成的操作类型（'注册', '识别', '下载JPEG', '下载RAW', '待机'）
+        """
+        if self.sequence_running and self.sequence_wait_response == operation_type:
+            self.sequence_wait_response = None
+            # 延迟100ms后执行下一步，确保当前操作完全结束
+            QTimer.singleShot(100, self.execute_next_sequence_step)
 
     def closeEvent(self, event):
         """关闭事件"""
