@@ -1183,6 +1183,20 @@ class MainWindow(QMainWindow):
         self.repeat_success_count = 0  # 成功次数统计
         self.repeat_reply_received = False  # 当前操作是否已收到Reply（防止多次Reply触发）
 
+        # OTA升级相关
+        self.ota_in_progress = False  # 是否正在进行OTA
+        self.ota_file_path = None  # OTA固件包路径
+        self.ota_file_data = None  # OTA固件包数据
+        self.ota_packet_size = 4096  # 每包大小（默认4096字节）
+        self.ota_total_packets = 0  # 总包数
+        self.ota_current_packet = 0  # 当前发送的包序号
+        self.ota_stage = 0  # OTA阶段：0=未开始, 1=设置波特率, 2=进入OTA, 3=发送header, 4=发送固件包, 5=等待烧录完成
+        self.ota_retry_timer = None  # OTA超时重传定时器
+        self.ota_retry_count = 0  # 当前包的重传次数
+
+        # 待机相关
+        self.is_standby_restoring = False  # 是否正在待机恢复波特率
+
         # 自动执行序列相关
         self.sequence_list = []  # 操作序列列表
         self.sequence_running = False  # 是否正在执行序列
@@ -1870,6 +1884,15 @@ class MainWindow(QMainWindow):
         self.btn_custom_command = btn_custom_command
         more_button_grid.addWidget(btn_custom_command, 2, 0)
 
+        # OTA升级 - 第五行
+        btn_ota = QPushButton('🔄 OTA升级')
+        btn_ota.clicked.connect(self.start_ota_upgrade)
+        btn_ota.setEnabled(False)
+        btn_ota.setFixedSize(button_width, button_height)
+        btn_ota.setStyleSheet('QPushButton { background-color: #9c27b0; color: white; font-weight: bold; }')
+        self.btn_ota = btn_ota
+        more_button_grid.addWidget(btn_ota, 2, 1)
+
         # 添加弹性空间
         more_button_grid.setColumnStretch(4, 1)
 
@@ -1897,7 +1920,10 @@ class MainWindow(QMainWindow):
 
         self.module_response_text = QTextEdit()
         self.module_response_text.setReadOnly(True)
-        self.module_response_text.setFont(QFont('Consolas', 9))
+        response_font = QFont('Consolas', 10)
+        response_font.setBold(False)
+        self.module_response_text.setFont(response_font)
+        self.module_response_text.setStyleSheet('QTextEdit { color: #000000; }')
         self.module_response_text.setMinimumHeight(300)
         self.module_response_text.setPlaceholderText('模组响应信息将显示在这里...')
         # 连接鼠标点击事件
@@ -4383,6 +4409,7 @@ class MainWindow(QMainWindow):
             self.btn_enter_debug.setEnabled(True)
             self.btn_exit_debug.setEnabled(True)
             self.btn_custom_command.setEnabled(True)
+            self.btn_ota.setEnabled(True)
 
             self.append_module_log(f'[模组] 已连接到 {port} @ {baudrate}bps')
 
@@ -4438,6 +4465,7 @@ class MainWindow(QMainWindow):
             self.btn_enter_debug.setEnabled(False)
             self.btn_exit_debug.setEnabled(False)
             self.btn_custom_command.setEnabled(False)
+            self.btn_ota.setEnabled(False)
 
             self.append_module_log('[模组] 已断开连接')
 
@@ -4525,8 +4553,8 @@ class MainWindow(QMainWindow):
                     # Reply消息: ('reply', msg_id, result, payload)
                     _, msg_id, result, payload = response
                     # 优化：下载期间减少打印
-                    if not self.is_downloading or msg_id not in [0x18, 0x51]:
-                        print(f'[调试-Reply] msg_id=0x{msg_id:02X}, result=0x{result:02X}, payload长度={len(payload)}')
+                    # if not self.is_downloading or msg_id not in [0x18, 0x51]:
+                    #     print(f'[调试-Reply] msg_id=0x{msg_id:02X}, result=0x{result:02X}, payload长度={len(payload)}')
                     self.module_response_signal.emit(f'0x{msg_id:02X}', ('reply', result, payload))
                 elif response[0] == 'note':
                     # Note消息: ('note', data)
@@ -4745,12 +4773,36 @@ class MainWindow(QMainWindow):
 
                 if baudrate_code is not None:
                     baudrate = baudrate_map.get(baudrate_code, baudrate_code)
-                    self.append_module_log(f'设置波特率为 {baudrate} 成功！{elapsed_time}', success=True)
-                    print(f'[调试-0x51] 准备切换波特率到 {baudrate}')
+                    self.append_module_log(f'设置波特率成功！{elapsed_time}', success=True)
+                    print(f'[调试-0x51] 推断波特率: {baudrate}')
+                    print(f'[调试-0x51] ota_in_progress={self.ota_in_progress}, ota_stage={self.ota_stage}')
+                    print(f'[调试-0x51] is_standby_restoring={getattr(self, "is_standby_restoring", False)}')
 
-                    # 如果设置了高速波特率，需要更新串口波特率并继续下载流程
-                    if baudrate == 1500000 and self.module_serial:
-                        print(f'[调试-0x51] 开始切换串口波特率...')
+                    # 判断是OTA升级还是图片下载
+                    if self.ota_in_progress and self.ota_stage == 1:
+                        # OTA升级流程：使用保存的目标波特率，而不是推断的波特率
+                        actual_baudrate = getattr(self, 'ota_target_baudrate', baudrate)
+                        print(f'[调试-0x51] OTA升级流程，切换波特率到 {actual_baudrate}（目标波特率）')
+                        if self.module_serial:
+                            try:
+                                self.module_serial.baudrate = actual_baudrate
+                                self.append_module_log(f'[OTA] 串口波特率已切换到 {actual_baudrate}')
+                                # 进入下一阶段：发送0x40进入OTA状态
+                                self.ota_stage = 2
+                                QTimer.singleShot(100, self.enter_ota_mode)
+                            except Exception as e:
+                                self.append_module_log(f'[OTA] 切换波特率失败: {e}', error=True)
+                                self.ota_in_progress = False
+                    elif self.ota_in_progress and self.ota_stage > 1:
+                        # OTA升级过程中（stage > 1），忽略其他0x51响应
+                        print(f'[调试-0x51] OTA升级过程中，忽略0x51响应（stage={self.ota_stage}）')
+                    elif getattr(self, 'is_standby_restoring', False):
+                        # 待机恢复波特率，不触发任何操作
+                        print(f'[调试-0x51] 待机恢复波特率，不触发图片下载')
+                        self.is_standby_restoring = False
+                    elif baudrate == 1500000 and self.module_serial:
+                        # 图片下载流程
+                        print(f'[调试-0x51] 图片下载流程，开始切换串口波特率...')
                         try:
                             self.module_serial.baudrate = baudrate
                             print(f'[调试-0x51] 串口波特率切换成功')
@@ -4767,13 +4819,20 @@ class MainWindow(QMainWindow):
                         print(f'[调试-0x51] 恢复标准波特率')
                         self.module_serial.baudrate = baudrate
                         self.append_module_log(f'串口波特率已恢复到 {baudrate}')
-                        self.append_module_log('[完成] 图片下载流程完成！', success=True)
 
-                        # 检查是否需要执行序列的下一步
-                        if self.download_type == 'jpeg':
-                            self.check_sequence_next('下载JPEG')
-                        elif self.download_type == 'raw':
-                            self.check_sequence_next('下载RAW')
+                        # 判断是否是待机恢复波特率
+                        if getattr(self, 'is_standby_restoring', False):
+                            print(f'[调试-0x51] 这是待机恢复波特率，不触发图片下载')
+                            self.is_standby_restoring = False  # 重置标志
+                        else:
+                            # 图片下载流程完成
+                            self.append_module_log('[完成] 图片下载流程完成！', success=True)
+
+                            # 检查是否需要执行序列的下一步
+                            if self.download_type == 'jpeg':
+                                self.check_sequence_next('下载JPEG')
+                            elif self.download_type == 'raw':
+                                self.check_sequence_next('下载RAW')
                     else:
                         print(f'[调试-0x51] 波特率={baudrate}, 不执行切换逻辑')
                 else:
@@ -5146,6 +5205,80 @@ class MainWindow(QMainWindow):
             self.check_sequence_next('进入Debug')
             self.check_sequence_next('退出Debug')
 
+        elif msg_id == '0x40':  # 进入OTA状态
+            print(f'[OTA调试] 收到0x40响应: result=0x{result:02X}, payload长度={len(payload)}')
+            if len(payload) > 0:
+                print(f'[OTA调试] payload: {payload.hex().upper()}')
+            if result == 0x00:
+                self.append_module_log(f'[OTA] 进入OTA状态成功 {elapsed_time}', success=True)
+                # 进入下一阶段：发送OTA header
+                if self.ota_in_progress and self.ota_stage == 2:
+                    self.ota_stage = 3
+                    QTimer.singleShot(100, self.send_ota_header)
+            else:
+                self.append_module_log(f'[OTA] 进入OTA状态失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+                self.ota_in_progress = False
+
+        elif msg_id == '0x43':  # OTA header
+            print(f'[OTA调试] 收到0x43响应: result=0x{result:02X}, payload长度={len(payload)}')
+            if len(payload) > 0:
+                print(f'[OTA调试] payload: {payload.hex().upper()}')
+            if result == 0x00:
+                self.append_module_log(f'[OTA] OTA header发送成功 {elapsed_time}', success=True)
+                # 进入下一阶段：发送固件包
+                if self.ota_in_progress and self.ota_stage == 3:
+                    self.ota_stage = 4
+                    self.ota_current_packet = 0
+                    QTimer.singleShot(100, self.send_ota_packet)
+            else:
+                self.append_module_log(f'[OTA] OTA header发送失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+                self.ota_in_progress = False
+
+        elif msg_id == '0x44':  # OTA固件包传输
+            # 只在每10包或出错时打印调试信息
+            if self.ota_current_packet % 10 == 0 or result != 0x00:
+                print(f'[OTA调试] 收到0x44响应: 包序号={self.ota_current_packet}, result=0x{result:02X}')
+
+            if result == 0x00:
+                # 停止超时重传定时器
+                if self.ota_retry_timer:
+                    self.ota_retry_timer.stop()
+                    self.ota_retry_timer = None
+
+                # 传输成功，重置重传次数
+                self.ota_retry_count = 0
+
+                # 继续发送下一包
+                if self.ota_in_progress and self.ota_stage == 4:
+                    self.ota_current_packet += 1
+                    progress = (self.ota_current_packet / self.ota_total_packets) * 100
+
+                    # 每10包或最后一包显示进度
+                    if self.ota_current_packet % 10 == 0 or self.ota_current_packet >= self.ota_total_packets:
+                        self.append_module_log(f'[OTA] 传输进度: {self.ota_current_packet}/{self.ota_total_packets} ({progress:.1f}%)')
+
+                    if self.ota_current_packet < self.ota_total_packets:
+                        # 继续发送下一包
+                        QTimer.singleShot(10, self.send_ota_packet)
+                    else:
+                        # 所有包发送完成，等待烧录
+                        self.append_module_log('[OTA] 所有固件包发送完成，等待模组烧录...', success=True)
+                        self.ota_stage = 5
+            else:
+                self.append_module_log(f'[OTA] 固件包传输失败，包序号: {self.ota_current_packet}, 结果码: 0x{result:02X}', error=True)
+                # 停止超时重传定时器
+                if self.ota_retry_timer:
+                    self.ota_retry_timer.stop()
+                    self.ota_retry_timer = None
+                # 传输失败，尝试重传
+                if self.ota_retry_count < 3:
+                    self.ota_retry_count += 1
+                    self.append_module_log(f'[OTA] 第{self.ota_retry_count}次重传包序号: {self.ota_current_packet}')
+                    QTimer.singleShot(100, self.send_ota_packet)
+                else:
+                    self.append_module_log(f'[OTA] 包序号{self.ota_current_packet}重传3次后仍失败，终止OTA升级', error=True)
+                    self.ota_in_progress = False
+
     def handle_note_message(self, data):
         """处理Note消息"""
         # 特殊处理：重启模组的Note消息（datasize=1，只有1字节）
@@ -5161,6 +5294,36 @@ class MainWindow(QMainWindow):
         # Note消息格式：第1字节是NID，标识消息类型
         if len(data) >= 2:
             nid = data[0]
+
+            # OTA过程结束通知（data[0]=0x03, data[1]=0x00表示OTA结束）
+            if nid == 0x03:
+                status = data[1] if len(data) >= 2 else 0xFF
+                print(f'[OTA调试] 收到OTA结束Note消息: nid=0x{nid:02X}, status=0x{status:02X}')
+                hex_data = ' '.join([f'{b:02X}' for b in data])
+                print(f'[OTA调试] Note完整数据: {hex_data}')
+                if status == 0x00:
+                    QTimer.singleShot(300, lambda: self.append_module_log('[OTA] 烧录完成！', success=True))
+                    # 等待模组重启并发送ready消息
+                    self.ota_stage = 6
+                else:
+                    self.append_module_log(f'[OTA] 烧录失败，状态码: 0x{status:02X}', error=True)
+                    self.ota_in_progress = False
+                return
+
+            # Ready消息（data[0]=0x00, data[1]=0x00表示模组ready）
+            if nid == 0x00 and len(data) >= 2:
+                status = data[1]
+                print(f'[OTA调试] 收到Ready消息: nid=0x{nid:02X}, status=0x{status:02X}')
+                hex_data = ' '.join([f'{b:02X}' for b in data])
+                print(f'[OTA调试] Note完整数据: {hex_data}')
+                if status == 0x00:
+                    if self.ota_in_progress and self.ota_stage == 6:
+                        self.append_module_log('[OTA] 模组重启成功，OTA升级完成！', success=True)
+                        self.ota_in_progress = False
+                        self.ota_stage = 0
+                    else:
+                        self.append_module_log('[模组] Ready消息收到', success=True)
+                return
 
             # 判断是人脸还是手掌
             if nid == 0x01:  # 人脸Note消息
@@ -5337,6 +5500,11 @@ class MainWindow(QMainWindow):
 
             # 完整消息
             message = sync + msg_id_byte + data_size + data + bytes([checksum])
+
+            # # 打印调试信息（对OTA相关指令）
+            # if msg_id in [0x40, 0x43, 0x44, 0x51]:
+            #     hex_msg = ' '.join([f'{b:02X}' for b in message])
+            #     print(f'[发送指令] MID=0x{msg_id:02X}, 完整消息: {hex_msg}')
 
             # 发送
             self.module_serial.write(message)
@@ -5679,10 +5847,23 @@ class MainWindow(QMainWindow):
 
     def standby_module(self):
         """待机模组"""
+        # 停止OTA升级流程
+        if self.ota_in_progress:
+            self.append_module_log('[待机] 停止OTA升级流程...')
+            self.ota_in_progress = False
+            self.ota_stage = 0
+            self.ota_current_packet = 0
+            self.ota_retry_count = 0
+            if self.ota_retry_timer:
+                self.ota_retry_timer.stop()
+                self.ota_retry_timer = None
+
         # 先恢复波特率到115200并停止当前所有操作
         if self.module_serial and self.module_serial.baudrate != 115200:
             try:
                 self.append_module_log('[待机] 正在恢复波特率到115200...')
+                # 设置待机恢复标志
+                self.is_standby_restoring = True
                 # 发送0x51指令设置波特率为115200
                 self.send_module_command(0x51, b'\x01')  # 0x01 = 115200
                 # 立即停止所有下载操作
@@ -6053,9 +6234,9 @@ class MainWindow(QMainWindow):
 
         # 设置颜色
         if success:
-            color = '#2e8b57'  # 绿色
+            color = '#00CC00'  # 亮绿色
         elif error:
-            color = '#c0392b'  # 红色
+            color = '#FF0000'  # 亮红色
         else:
             color = '#333333' if not self.dark_mode else '#e0e0e0'  # 默认颜色
 
@@ -6221,6 +6402,267 @@ class MainWindow(QMainWindow):
             self.sequence_wait_response = None
             # 延迟100ms后执行下一步，确保当前操作完全结束
             QTimer.singleShot(100, self.execute_next_sequence_step)
+
+    # ==============================
+    # OTA升级相关方法
+    # ==============================
+
+    def start_ota_upgrade(self):
+        """启动OTA升级流程"""
+        if self.ota_in_progress:
+            QMessageBox.warning(self, '提示', 'OTA升级正在进行中，请勿重复操作')
+            return
+
+        # 创建OTA配置对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle('OTA升级配置')
+        dialog.setMinimumWidth(500)
+
+        layout = QVBoxLayout(dialog)
+
+        # 选择OTA固件包
+        file_layout = QHBoxLayout()
+        file_layout.addWidget(QLabel('固件包:'))
+        self.ota_file_input = QLineEdit()
+        self.ota_file_input.setReadOnly(True)
+        file_layout.addWidget(self.ota_file_input)
+
+        btn_browse = QPushButton('📂 浏览')
+        btn_browse.clicked.connect(lambda: self.browse_ota_file(dialog))
+        file_layout.addWidget(btn_browse)
+        layout.addLayout(file_layout)
+
+        # 波特率设置
+        baudrate_layout = QHBoxLayout()
+        baudrate_layout.addWidget(QLabel('OTA波特率:'))
+        self.ota_baudrate_combo = QComboBox()
+        self.ota_baudrate_combo.addItems(['115200', '230400', '460800', '1500000'])
+        self.ota_baudrate_combo.setCurrentText('1500000')
+        baudrate_layout.addWidget(self.ota_baudrate_combo)
+        baudrate_layout.addStretch()
+        layout.addLayout(baudrate_layout)
+
+        # 包大小设置
+        packet_layout = QHBoxLayout()
+        packet_layout.addWidget(QLabel('单包大小(字节):'))
+        self.ota_packet_size_spin = QSpinBox()
+        self.ota_packet_size_spin.setMinimum(512)
+        self.ota_packet_size_spin.setMaximum(8192)
+        self.ota_packet_size_spin.setValue(4000)
+        self.ota_packet_size_spin.setSingleStep(512)
+        packet_layout.addWidget(self.ota_packet_size_spin)
+        packet_layout.addStretch()
+        layout.addLayout(packet_layout)
+
+        # 提示信息
+        info_label = QLabel('💡 提示：\n1. 请确保固件包文件完整\n2. 升级过程中请勿断开连接\n3. 升级时间约需1-5分钟')
+        info_label.setStyleSheet('background-color: #e3f2fd; padding: 10px; border-radius: 4px;')
+        layout.addWidget(info_label)
+
+        # 按钮
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        btn_cancel = QPushButton('取消')
+        btn_cancel.clicked.connect(dialog.reject)
+        button_layout.addWidget(btn_cancel)
+
+        btn_start = QPushButton('开始升级')
+        btn_start.setStyleSheet('QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 16px; }')
+        btn_start.clicked.connect(dialog.accept)
+        button_layout.addWidget(btn_start)
+
+        layout.addLayout(button_layout)
+
+        # 显示对话框
+        if dialog.exec() == QDialog.Accepted:
+            # 验证参数
+            if not self.ota_file_input.text():
+                QMessageBox.warning(self, '提示', '请选择固件包文件')
+                return
+
+            # 开始OTA升级
+            self.execute_ota_upgrade()
+
+    def browse_ota_file(self, parent):
+        """浏览选择OTA固件包"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            parent,
+            '选择OTA固件包',
+            '',
+            'Bin文件 (*.bin);;所有文件 (*.*)'
+        )
+        if file_path:
+            self.ota_file_input.setText(file_path)
+
+    def execute_ota_upgrade(self):
+        """执行OTA升级"""
+        try:
+            # 读取固件包
+            self.ota_file_path = self.ota_file_input.text()
+            with open(self.ota_file_path, 'rb') as f:
+                self.ota_file_data = f.read()
+
+            file_size = len(self.ota_file_data)
+            self.append_module_log(f'[OTA] 固件包加载成功，大小: {file_size} 字节')
+
+            # 获取配置
+            self.ota_packet_size = self.ota_packet_size_spin.value()
+            self.ota_total_packets = (file_size + self.ota_packet_size - 1) // self.ota_packet_size
+
+            self.append_module_log(f'[OTA] 配置: 单包大小={self.ota_packet_size}字节, 总包数={self.ota_total_packets}')
+
+            # 开始OTA流程
+            self.ota_in_progress = True
+            self.ota_stage = 1
+            self.ota_current_packet = 0
+
+            # 步骤1: 设置波特率（根据用户选择）
+            baudrate_str = self.ota_baudrate_combo.currentText()
+            baudrate_map = {
+                '115200': (0x01, 115200),
+                '230400': (0x02, 230400),
+                '460800': (0x03, 460800),
+                '1500000': (0x04, 1500000),
+            }
+            baudrate_code, baudrate_value = baudrate_map.get(baudrate_str, (0x04, 1500000))
+
+            self.append_module_log(f'[OTA] 步骤1: 设置波特率为 {baudrate_value}')
+            # 保存目标波特率，供0x51响应处理使用
+            self.ota_target_baudrate = baudrate_value
+            print(f'[OTA调试] 发送0x51指令，波特率代码: 0x{baudrate_code:02X}, 目标波特率: {baudrate_value}')
+            self.send_module_command(0x51, bytes([baudrate_code]))
+
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'OTA升级失败:\n{e}')
+            self.ota_in_progress = False
+
+    def switch_baudrate_for_ota(self, baudrate):
+        """切换串口波特率（用于OTA）"""
+        try:
+            if self.module_serial:
+                self.module_serial.baudrate = baudrate
+                self.append_module_log(f'[OTA] 串口波特率已切换到 {baudrate}')
+
+                # 步骤2: 发送0x40进入OTA状态
+                self.ota_stage = 2
+                QTimer.singleShot(100, self.enter_ota_mode)
+        except Exception as e:
+            self.append_module_log(f'[OTA] 切换波特率失败: {e}', error=True)
+            self.ota_in_progress = False
+
+    def enter_ota_mode(self):
+        """进入OTA模式"""
+        self.append_module_log('[OTA] 步骤2: 进入OTA状态')
+        # 发送0x40指令进入OTA状态
+        print(f'[OTA调试] 发送0x40指令: EF AA 40 00 00 40')
+        self.send_module_command(0x40)
+
+    def send_ota_header(self):
+        """发送OTA header"""
+        try:
+            import hashlib
+
+            self.append_module_log('[OTA] 步骤3: 发送OTA header')
+
+            file_size = len(self.ota_file_data)
+            packet_count = self.ota_total_packets
+            packet_size = self.ota_packet_size
+
+            # 计算MD5
+            md5_hash = hashlib.md5(self.ota_file_data).hexdigest()
+            # MD5要转换成32字节的ASCII字符串，而不是16字节的二进制
+            md5_bytes = md5_hash.encode('ascii')  # 32字节的ASCII字符串
+
+            self.append_module_log(f'[OTA] 文件大小: {file_size}, 包数量: {packet_count}, 单包大小: {packet_size}')
+            self.append_module_log(f'[OTA] MD5: {md5_hash}')
+
+            # 打印MD5详细信息
+            print(f'[OTA调试] MD5字符串: {md5_hash}')
+            print(f'[OTA调试] MD5字节数: {len(md5_bytes)}')
+            md5_hex = ' '.join([f'{b:02X}' for b in md5_bytes])
+            print(f'[OTA调试] MD5十六进制(ASCII): {md5_hex}')
+
+            # 构建header数据
+            # 包大小（4字节，大端序）
+            data = file_size.to_bytes(4, byteorder='big')
+            print(f'[OTA调试] 文件大小(4字节): {" ".join([f"{b:02X}" for b in data])} = {file_size}')
+
+            # 分包数量（4字节，大端序）
+            data += packet_count.to_bytes(4, byteorder='big')
+            print(f'[OTA调试] 包数量(4字节): {" ".join([f"{b:02X}" for b in packet_count.to_bytes(4, byteorder="big")])} = {packet_count}')
+
+            # 单包大小（2字节，大端序）
+            data += packet_size.to_bytes(2, byteorder='big')
+            print(f'[OTA调试] 单包大小(2字节): {" ".join([f"{b:02X}" for b in packet_size.to_bytes(2, byteorder="big")])} = {packet_size}')
+
+            # 文件校验位（32字节，MD5的ASCII字符串形式）
+            data += md5_bytes
+
+            # 打印完整header
+            hex_data = ' '.join([f'{b:02X}' for b in data])
+            print(f'[OTA调试] 完整header数据(42字节): {hex_data}')
+            print(f'[OTA调试] Header数据长度: {len(data)}字节')
+
+            # 发送0x43指令
+            self.send_module_command(0x43, data)
+
+        except Exception as e:
+            self.append_module_log(f'[OTA] 发送header失败: {e}', error=True)
+            self.ota_in_progress = False
+
+    def send_ota_packet(self):
+        """发送OTA固件包"""
+        try:
+            if not self.ota_in_progress or self.ota_current_packet >= self.ota_total_packets:
+                return
+
+            # 计算当前包的偏移和大小
+            offset = self.ota_current_packet * self.ota_packet_size
+            remaining = len(self.ota_file_data) - offset
+            current_packet_size = min(self.ota_packet_size, remaining)
+
+            # 提取当前包的数据
+            packet_data = self.ota_file_data[offset:offset + current_packet_size]
+
+            # 构建44指令的数据部分
+            # 包序（2字节，大端序）
+            data = self.ota_current_packet.to_bytes(2, byteorder='big')
+            # 包长（2字节，大端序）
+            data += current_packet_size.to_bytes(2, byteorder='big')
+            # 包内容
+            data += packet_data
+
+            # 发送0x44指令
+            self.send_module_command(0x44, data)
+
+            # 停止之前的超时定时器
+            if self.ota_retry_timer:
+                self.ota_retry_timer.stop()
+
+            # 启动超时重传定时器（3秒超时）
+            self.ota_retry_timer = QTimer()
+            self.ota_retry_timer.setSingleShot(True)
+            self.ota_retry_timer.timeout.connect(self.on_ota_packet_timeout)
+            self.ota_retry_timer.start(3000)  # 3秒超时
+
+        except Exception as e:
+            self.append_module_log(f'[OTA] 发送固件包失败: {e}', error=True)
+            self.ota_in_progress = False
+
+    def on_ota_packet_timeout(self):
+        """OTA固件包传输超时处理"""
+        if not self.ota_in_progress or self.ota_stage != 4:
+            return
+
+        if self.ota_retry_count < 3:
+            self.ota_retry_count += 1
+            self.append_module_log(f'[OTA] 包序号{self.ota_current_packet}超时，第{self.ota_retry_count}次重传...', error=True)
+            self.send_ota_packet()
+        else:
+            self.append_module_log(f'[OTA] 包序号{self.ota_current_packet}重传3次后仍超时，终止OTA升级', error=True)
+            self.ota_in_progress = False
+            self.ota_stage = 0
 
     def closeEvent(self, event):
         """关闭事件"""
