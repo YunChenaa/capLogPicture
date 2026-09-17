@@ -13,18 +13,31 @@ import serial
 import queue
 import json
 import sys
+import tempfile
+import ctypes
+from ctypes import wintypes
+from dataclasses import dataclass
+from pathlib import Path
 import serial.tools.list_ports
 import re
+
+if sys.platform == 'win32':
+    import winreg
+else:
+    winreg = None
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTextEdit, QComboBox, QLineEdit, QCheckBox,
     QRadioButton, QButtonGroup, QTabWidget, QMessageBox, QFileDialog,
     QDialog, QGroupBox, QFrame, QSplitter, QScrollArea, QSpinBox, QInputDialog,
-    QGridLayout, QMenu, QListWidget
+    QGridLayout, QMenu, QListWidget, QWidgetAction, QTableWidget,
+    QTableWidgetItem, QHeaderView, QAbstractItemView, QDialogButtonBox
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QSize
-from PySide6.QtGui import QFont, QTextCursor, QPalette, QColor, QPixmap, QImage, QTextDocument, QShortcut, QKeySequence, QTransform
+from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QSize, QEvent, QPoint
+from PySide6.QtGui import QFont, QTextCursor, QPalette, QColor, QPixmap, QImage, QTextDocument, QShortcut, QKeySequence, QTransform, QTextCharFormat, QIcon, QActionGroup, QTextBlockUserData
+
+import theme_icons_rc  # 注册内嵌图标，源码运行和打包后均不依赖外部图片路径
 
 from datetime import datetime
 from collections import deque
@@ -50,32 +63,375 @@ def strip_ansi_codes(text):
 LOG_CACHE_SIZE = 1000
 log_cache = deque(maxlen=LOG_CACHE_SIZE)
 full_log_cache = []
+log_cache_lock = threading.RLock()
 module_log_cache = []  # 模组响应日志缓存（格式：[(text, success, error), ...]）
 
+LOG_POLL_INTERVAL_MS = 50
+LOG_BATCH_MAX_LINES = 200
+LOG_BATCH_BUDGET_SECONDS = 0.008
+LOG_DISPLAY_MAX_LINES = 5000
+
+# 预编译高亮规则，数字越大优先级越高；只对关键字忽略大小写。
+LOG_HIGHLIGHT_RULES = (
+    ('timestamp', re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\]'), 8),
+    ('hex', re.compile(r'\b0x[0-9A-Fa-f]+\b'), 5),
+    ('number', re.compile(r'\b\d+\b'), 3),
+    ('keyword', re.compile(r'\b(成功|warning|success|connected|发送|接收|下载)\b', re.IGNORECASE), 7),
+    ('bracket', re.compile(r'[\[\](){}]'), 2),
+    ('symbol', re.compile(r'[,:;=<>+\-*/]'), 1),
+    ('keyword_err', re.compile(r'\b(失败|错误|error|failed|timeout|disconnected)\b', re.IGNORECASE), 6),
+    ('upper_letter', re.compile(r'\b[A-Z]+\b'), 4),
+)
+LOG_HIGHLIGHT_COLORS = {
+    False: {
+        'timestamp': '#0066CC', 'bracket': '#216AAF', 'number': '#098658',
+        'hex': '#78E22E', 'keyword': '#0000FF', 'keyword_err': '#A31515',
+        'symbol': '#41B9EF', 'text': '#000000', 'upper_letter': '#EC5800',
+        'background': 'white',
+    },
+    True: {
+        'timestamp': '#87CEEB', 'bracket': '#216AAF', 'number': '#098658',
+        'hex': '#78E22E', 'keyword': '#87CEEB', 'keyword_err': '#EC5800',
+        'symbol': '#41B9EF', 'text': '#F8F9FA', 'upper_letter': '#FFB6C1',
+        'background': '#1e1e1e',
+    },
+}
+
 # ==============================
-# 日志提取工具函数
+# 日志提取与外部查看工具
 # ==============================
+
+FULL_LOG_SNAPSHOT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+FULL_LOG_SNAPSHOT_DIR = Path(tempfile.gettempdir()) / 'capLG' / 'full_logs'
+
+
+class LogBlockData(QTextBlockUserData):
+    """记录可见文本块对应的完整缓存绝对索引。"""
+
+    def __init__(self, log_index):
+        super().__init__()
+        self.log_index = log_index
+
+
+@dataclass(frozen=True)
+class QueuedLog:
+    """携带完整缓存绝对索引的待渲染串口日志。"""
+    log_index: int
+    text: str
+
+
+@dataclass
+class LogMarker:
+    """绑定到完整日志绝对索引的会话内打点。"""
+    marker_id: int
+    name: str
+    created_at: datetime
+    log_index: int
+    log_count: int
+    line_text: str
+
+    @property
+    def summary(self):
+        return self.line_text[:10]
+
+    @property
+    def line_number(self):
+        return self.log_index + 1
+
+
+@dataclass(frozen=True)
+class TextViewer:
+    """本机可直接启动的文本查看器。"""
+    name: str
+    executable: str
+    arguments: tuple = ('%1',)
+
+
+TEXT_VIEWER_NAMES = {
+    'notepad.exe': '记事本',
+    'notepad++.exe': 'Notepad++',
+    'code.exe': 'Visual Studio Code',
+    'sublime_text.exe': 'Sublime Text',
+    'wordpad.exe': '写字板',
+    'write.exe': '写字板',
+}
+
 
 def extract_logs(strategy, param=None):
     """根据策略从 full_log_cache 中提取日志"""
-    if not full_log_cache:
+    with log_cache_lock:
+        logs = list(full_log_cache)
+    if not logs:
         return []
 
     if strategy == 'all':
-        return list(full_log_cache)
+        return logs
     elif strategy == 'recent_n':
         n = int(param) if param else 100
-        return list(full_log_cache[-n:]) if n > 0 else []
+        return logs[-n:] if n > 0 else []
     elif strategy == 'from_keyword':
         keyword = str(param) if param else ''
         if not keyword:
             return []
-        for i in range(len(full_log_cache) - 1, -1, -1):
-            if keyword in full_log_cache[i]:
-                return list(full_log_cache[i:])
+        for i in range(len(logs) - 1, -1, -1):
+            if keyword in logs[i]:
+                return logs[i:]
         return []
     else:
-        return list(full_log_cache)
+        return logs
+
+
+def markers_for_save(markers, start_index=0, start_marker_id=None):
+    """返回所选记录之后创建、且位于保存日志范围内的打点。"""
+    return [marker for marker in markers
+            if marker.log_index >= start_index
+            and (start_marker_id is None or marker.marker_id >= start_marker_id)]
+
+
+def format_marker_section(markers, start_index=0, start_marker_id=None):
+    """生成追加在日志正文后的可读打点信息区块。"""
+    applicable = markers_for_save(markers, start_index, start_marker_id)
+    if not applicable:
+        return ''
+    lines = ['', '========== 打点记录 ==========']
+    for marker in applicable:
+        relative_line = marker.log_index - start_index + 1
+        lines.extend((
+            f'名称: {marker.name}',
+            f'打点时间: {marker.created_at.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}',
+            f'原始日志行号: {marker.line_number}',
+            f'保存文件相对行号: {relative_line}',
+            f'打点时日志总行数: {marker.log_count}',
+            f'日志摘要: {marker.summary}',
+            '------------------------------',
+        ))
+    return '\n'.join(lines) + '\n'
+
+
+def build_marked_log_text(logs, markers, start_index=0, start_marker_id=None):
+    """构建选定范围日志正文及其适用打点区块。"""
+    body = '\n'.join(logs[start_index:])
+    if body:
+        body += '\n'
+    return body + format_marker_section(markers, start_index, start_marker_id)
+
+
+def _windows_command_line_to_argv(command):
+    """按Windows命令行规则拆分注册表中的打开命令。"""
+    if not command or sys.platform != 'win32':
+        return []
+    command = os.path.expandvars(command.strip())
+    argc = ctypes.c_int()
+    shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+    shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    argv = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+    if not argv:
+        return []
+    try:
+        return [argv[index] for index in range(argc.value)]
+    finally:
+        kernel32.LocalFree(argv)
+
+
+def _normalize_viewer_command(command):
+    """将注册命令转换为可安全交给Popen的程序和参数。"""
+    argv = _windows_command_line_to_argv(command)
+    if not argv:
+        return None
+    executable = os.path.abspath(os.path.expandvars(argv[0]))
+    if not os.path.isfile(executable):
+        return None
+    arguments = []
+    has_file_placeholder = False
+    for argument in argv[1:]:
+        # Shell动态占位符无法通过普通Popen安全复现，交给系统“打开方式”。
+        if re.search(r'%[2-9*]', argument):
+            continue
+        if re.search(r'%(?:1|l|L)', argument):
+            argument = re.sub(r'%(?:1|l|L)', '%1', argument)
+            has_file_placeholder = True
+        arguments.append(argument)
+    if not has_file_placeholder:
+        arguments.append('%1')
+    return executable, tuple(arguments)
+
+
+def _read_registry_default(root, path, access=0):
+    try:
+        with winreg.OpenKey(root, path, 0, winreg.KEY_READ | access) as key:
+            return winreg.QueryValueEx(key, '')[0]
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _registry_values(root, path, access=0):
+    try:
+        with winreg.OpenKey(root, path, 0, winreg.KEY_READ | access) as key:
+            return [winreg.EnumValue(key, index)[0]
+                    for index in range(winreg.QueryInfoKey(key)[1])]
+    except (FileNotFoundError, OSError):
+        return []
+
+
+def _registry_subkeys(root, path, access=0):
+    try:
+        with winreg.OpenKey(root, path, 0, winreg.KEY_READ | access) as key:
+            return [winreg.EnumKey(key, index)
+                    for index in range(winreg.QueryInfoKey(key)[0])]
+    except (FileNotFoundError, OSError):
+        return []
+
+
+def _viewer_display_name(executable):
+    basename = os.path.basename(executable).lower()
+    return TEXT_VIEWER_NAMES.get(basename, Path(executable).stem)
+
+
+def discover_text_viewers():
+    """发现Windows已注册且能解析到本地EXE的文本查看器。"""
+    if sys.platform != 'win32' or winreg is None:
+        return []
+
+    candidates = []
+    system_notepad = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'),
+                                  'System32', 'notepad.exe')
+    if os.path.isfile(system_notepad):
+        candidates.append((system_notepad, ('%1',)))
+
+    views = [0]
+    for flag in (getattr(winreg, 'KEY_WOW64_64KEY', 0),
+                 getattr(winreg, 'KEY_WOW64_32KEY', 0)):
+        if flag and flag not in views:
+            views.append(flag)
+
+    # App Paths覆盖了常用编辑器不完整或间接的文件关联注册。
+    # 仅主动探测明确的文本编辑器，避免把Office、浏览器等泛型文件处理器列入菜单。
+    app_names = set(TEXT_VIEWER_NAMES)
+    for view in views:
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for app_name in app_names:
+                path = _read_registry_default(
+                    root,
+                    rf'Software\Microsoft\Windows\CurrentVersion\App Paths\{app_name}',
+                    view,
+                )
+                if path and os.path.isfile(os.path.expandvars(path)):
+                    candidates.append((os.path.abspath(os.path.expandvars(path)), ('%1',)))
+
+    progids = set(_registry_values(winreg.HKEY_CLASSES_ROOT,
+                                   r'.txt\OpenWithProgids'))
+    progids.update(_registry_values(
+        winreg.HKEY_CURRENT_USER,
+        r'Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.txt\OpenWithProgids',
+    ))
+    command_paths = [rf'{progid}\shell\open\command' for progid in progids]
+    command_paths.extend((
+        r'SystemFileAssociations\text\shell\open\command',
+        r'SystemFileAssociations\.txt\shell\open\command',
+    ))
+
+    for app_name in app_names:
+        supported = _registry_values(
+            winreg.HKEY_CLASSES_ROOT,
+            rf'Applications\{app_name}\SupportedTypes',
+        )
+        if any(extension.lower() == '.txt' for extension in supported):
+            command_paths.append(rf'Applications\{app_name}\shell\open\command')
+
+    for view in views:
+        for path in command_paths:
+            normalized = _normalize_viewer_command(
+                _read_registry_default(winreg.HKEY_CLASSES_ROOT, path, view)
+            )
+            if normalized:
+                candidates.append(normalized)
+
+    viewers = {}
+    for executable, arguments in candidates:
+        basename = os.path.basename(executable).lower()
+        # 文件关联可能包含Office、浏览器等程序；直接菜单只保留文本编辑器。
+        if basename not in TEXT_VIEWER_NAMES:
+            continue
+        key = basename
+        current = viewers.get(key)
+        viewer = TextViewer(_viewer_display_name(executable), executable, tuple(arguments))
+        # 同名程序优先采用App Paths/商店版等非System32的实际安装路径。
+        if current is None or ('system32' in current.executable.lower()
+                               and 'system32' not in executable.lower()):
+            viewers[key] = viewer
+    return sorted(
+        viewers.values(),
+        key=lambda viewer: (os.path.basename(viewer.executable).lower() != 'notepad.exe',
+                            viewer.name.casefold(), viewer.executable.casefold()),
+    )
+
+
+def cleanup_old_log_snapshots(folder=FULL_LOG_SNAPSHOT_DIR, now=None):
+    """尽力删除七天前的临时快照，单个文件失败不影响查看。"""
+    now = time.time() if now is None else now
+    try:
+        entries = Path(folder).glob('capLG_full_log_*.txt')
+        for path in entries:
+            try:
+                if now - path.stat().st_mtime > FULL_LOG_SNAPSHOT_MAX_AGE_SECONDS:
+                    path.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def create_full_log_snapshot(lines=None, folder=FULL_LOG_SNAPSHOT_DIR, now=None):
+    """将完整缓存的点击时刻快照写成Windows文本编辑器友好的UTF-8文件。"""
+    if lines is None:
+        with log_cache_lock:
+            snapshot = list(full_log_cache)
+    else:
+        snapshot = list(lines)
+    if not snapshot:
+        raise ValueError('当前还没有产生任何日志')
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    cleanup_old_log_snapshots(folder, now=now)
+    moment = datetime.now()
+    filename = moment.strftime('capLG_full_log_%Y%m%d_%H%M%S_%f.txt')
+    path = folder / filename
+    with path.open('w', encoding='utf-8-sig', newline='') as stream:
+        stream.write('\r\n'.join(snapshot))
+        stream.write('\r\n')
+    return path
+
+
+def viewer_command(viewer, log_path):
+    """以参数列表替换文件占位符，绝不经由shell拼接。"""
+    path = str(log_path)
+    return [viewer.executable] + [argument.replace('%1', path)
+                                  for argument in viewer.arguments]
+
+
+def show_windows_open_with(log_path, owner=0):
+    """显示Windows原生“打开方式”对话框并执行用户选择。"""
+    if sys.platform != 'win32':
+        raise OSError('系统“打开方式”仅适用于Windows')
+
+    class OPENASINFO(ctypes.Structure):
+        _fields_ = (
+            ('pcszFile', wintypes.LPCWSTR),
+            ('pcszClass', wintypes.LPCWSTR),
+            ('oaifInFlags', wintypes.DWORD),
+        )
+
+    shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+    shell32.SHOpenWithDialog.argtypes = [wintypes.HWND, ctypes.POINTER(OPENASINFO)]
+    shell32.SHOpenWithDialog.restype = ctypes.c_long
+    info = OPENASINFO(str(log_path), None, 0x00000004)  # OAIF_EXEC
+    result = shell32.SHOpenWithDialog(owner, ctypes.byref(info))
+    if result < 0:
+        raise OSError(f'系统“打开方式”返回错误 0x{result & 0xffffffff:08X}')
 
 # ==============================
 # 配置路径
@@ -110,10 +466,15 @@ def _save_last_selection(data):
 class ImageViewerDialog(QDialog):
     """图片查看器 - 支持缩放、旋转、翻转等操作"""
 
-    def __init__(self, image_path, parent=None):
+    def __init__(self, image_path, parent=None, image_paths=None):
         super().__init__(parent)
         self.image_path = image_path
-        self.setWindowTitle(f'图片查看器 - {os.path.basename(image_path)}')
+        self.image_paths = list(image_paths) if image_paths else [image_path]
+        if image_path not in self.image_paths:
+            self.image_paths.insert(0, image_path)
+        self.image_index = self.image_paths.index(image_path)
+        self.fit_mode = True
+        self.drag_position = None
         self.resize(800, 600)
 
         # 图片变换参数
@@ -129,24 +490,64 @@ class ImageViewerDialog(QDialog):
         self.rect_right = 0
         self.rect_bottom = 0
 
-        # 加载原始图片
-        print(f'[调试] 正在加载图片: {image_path}')
-        print(f'[调试] 文件是否存在: {os.path.exists(image_path)}')
+        try:
+            self.original_pixmap, self.image_file_size = self.load_pixmap(image_path)
+        except (ValueError, OSError):
+            self.deleteLater()
+            raise
+        self.setup_ui()
+        self.update_image_info()
 
-        self.original_pixmap = QPixmap(image_path)
-        print(f'[调试] QPixmap 加载结果: isNull={self.original_pixmap.isNull()}')
-        print(f'[调试] 原始图片尺寸: {self.original_pixmap.width()} x {self.original_pixmap.height()}')
+        # 合并布局变化产生的适应请求，等待视口尺寸稳定
+        self.fit_timer = QTimer(self)
+        self.fit_timer.setSingleShot(True)
+        self.fit_timer.timeout.connect(self.refit_image)
+        self.fit_timer.start(0)
 
-        if self.original_pixmap.isNull():
-            QMessageBox.warning(self, '错误', '无法加载图片')
-            self.reject()
+    @staticmethod
+    def load_pixmap(image_path):
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            raise ValueError(f'无法加载图片：{image_path}')
+        return pixmap, os.path.getsize(image_path) / 1024
+
+    def update_image_info(self):
+        self.setWindowTitle(f'图片查看器 - {os.path.basename(self.image_path)}')
+        self.info_label.setText(
+            f'{self.original_pixmap.width()} × {self.original_pixmap.height()} px'
+            f' | {self.image_file_size:.1f} KB'
+        )
+        self.position_label.setText(f'{self.image_index + 1} / {len(self.image_paths)}')
+        self.btn_previous.setEnabled(self.image_index > 0)
+        self.btn_next.setEnabled(self.image_index < len(self.image_paths) - 1)
+
+    def change_image(self, offset):
+        index = self.image_index + offset
+        if not 0 <= index < len(self.image_paths):
+            return
+        path = self.image_paths[index]
+        try:
+            pixmap, file_size = self.load_pixmap(path)
+        except (ValueError, OSError) as e:
+            QMessageBox.warning(self, '错误', str(e))
             return
 
-        self.setup_ui()
-
-        # 延迟执行适应窗口，等待窗口完全显示后
-        print(f'[调试] 将在100ms后执行 zoom_fit')
-        QTimer.singleShot(100, self.zoom_fit)
+        self.image_index = index
+        self.image_path = path
+        self.original_pixmap = pixmap
+        self.image_file_size = file_size
+        self.rotation = 0
+        self.flip_h = False
+        self.flip_v = False
+        self.draw_rect = False
+        self.rect_left = self.rect_top = self.rect_right = self.rect_bottom = 0
+        for field in (self.smart_rect_input, self.rect_left_input, self.rect_top_input,
+                      self.rect_right_input, self.rect_bottom_input):
+            field.clear()
+        self.update_image_info()
+        self.zoom_fit()
+        self.scroll_area.horizontalScrollBar().setValue(0)
+        self.scroll_area.verticalScrollBar().setValue(0)
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -206,6 +607,10 @@ class ImageViewerDialog(QDialog):
         btn_flip_v.clicked.connect(self.flip_vertical)
         toolbar.addWidget(btn_flip_v)
 
+        for button in (btn_zoom_in, btn_zoom_out, btn_zoom_fit, btn_zoom_100,
+                       btn_rotate_left, btn_rotate_right, btn_flip_h, btn_flip_v):
+            button.setProperty('compactButton', True)
+
         toolbar.addWidget(QLabel('|'))
 
         btn_reset = QPushButton('🔄 重置')
@@ -223,14 +628,27 @@ class ImageViewerDialog(QDialog):
         toolbar.addStretch()
 
         # 图片信息
-        img_info = f'{self.original_pixmap.width()} × {self.original_pixmap.height()} px'
-        file_size = os.path.getsize(self.image_path) / 1024
-        info_text = f'{img_info} | {file_size:.1f} KB'
-        self.info_label = QLabel(info_text)
+        self.info_label = QLabel()
         self.info_label.setStyleSheet('color: #666666; font-size: 9pt;')
         toolbar.addWidget(self.info_label)
 
         layout.addLayout(toolbar)
+
+        navigation = QHBoxLayout()
+        self.btn_previous = QPushButton('◀ 上一张')
+        self.btn_previous.setToolTip('上一张（←）')
+        self.btn_previous.clicked.connect(lambda: self.change_image(-1))
+        navigation.addWidget(self.btn_previous)
+        self.position_label = QLabel()
+        self.position_label.setAlignment(Qt.AlignCenter)
+        navigation.addWidget(self.position_label)
+        self.btn_next = QPushButton('下一张 ▶')
+        self.btn_next.setToolTip('下一张（→）')
+        self.btn_next.clicked.connect(lambda: self.change_image(1))
+        navigation.addWidget(self.btn_next)
+        navigation.addStretch()
+        navigation.addWidget(QLabel('滚轮缩放 · 按住左键拖动'))
+        layout.addLayout(navigation)
 
         # 图片显示区域（带滚动）
         self.scroll_area = QScrollArea()
@@ -244,12 +662,21 @@ class ImageViewerDialog(QDialog):
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setScaledContents(False)
         self.scroll_area.setWidget(self.image_label)
+        for widget in (self.image_label, self.scroll_area.viewport()):
+            widget.installEventFilter(self)
+            widget.setCursor(Qt.OpenHandCursor)
 
-        layout.addWidget(self.scroll_area)
+        layout.addWidget(self.scroll_area, 1)
 
-        # 矩形框绘制区域
-        rect_group = QGroupBox('📦 绘制矩形框')
-        rect_main_layout = QVBoxLayout(rect_group)
+        # 矩形框绘制区域（默认折叠，为图片留出更多空间）
+        self.btn_toggle_rect = QPushButton('▶ 绘制矩形框')
+        self.btn_toggle_rect.setCheckable(True)
+        self.btn_toggle_rect.setStyleSheet('text-align: left;')
+        self.btn_toggle_rect.toggled.connect(self.toggle_rect_panel)
+        layout.addWidget(self.btn_toggle_rect)
+
+        self.rect_group = QGroupBox()
+        rect_main_layout = QVBoxLayout(self.rect_group)
 
         # 第一行：智能输入框
         smart_input_layout = QHBoxLayout()
@@ -305,7 +732,8 @@ class ImageViewerDialog(QDialog):
 
         rect_main_layout.addLayout(rect_layout)
 
-        layout.addWidget(rect_group)
+        layout.addWidget(self.rect_group)
+        self.rect_group.hide()
 
         # 底部按钮
         button_layout = QHBoxLayout()
@@ -316,56 +744,125 @@ class ImageViewerDialog(QDialog):
         button_layout.addWidget(btn_close)
 
         layout.addLayout(button_layout)
+        for widget in self.findChildren(QWidget):
+            widget.installEventFilter(self)
+
+    def toggle_rect_panel(self, expanded):
+        """展开/收起参数区，不改变绘制参数和已有矩形框"""
+        self.rect_group.setVisible(expanded)
+        self.btn_toggle_rect.setText('▼ 绘制矩形框' if expanded else '▶ 绘制矩形框')
 
     def zoom_in(self):
         """放大"""
-        print(f'[调试] zoom_in 被调用')
-        self.zoom_scale *= 1.25
-        self.update_image()
+        self.set_zoom(self.zoom_scale * 1.25)
 
     def zoom_out(self):
         """缩小"""
-        print(f'[调试] zoom_out 被调用')
-        self.zoom_scale /= 1.25
-        if self.zoom_scale < 0.05:
-            self.zoom_scale = 0.05
+        self.set_zoom(self.zoom_scale / 1.25)
+
+    def set_zoom(self, scale, anchor=None):
+        """缩放时尽量保持鼠标位置或视口中心的图片内容不动"""
+        self.fit_mode = False
+        viewport = self.scroll_area.viewport()
+        if anchor is None:
+            anchor = viewport.rect().center()
+        origin = self.image_label.mapTo(viewport, QPoint(0, 0))
+        old_size = self.image_label.size()
+        relative_x = (anchor.x() - origin.x()) / max(1, old_size.width())
+        relative_y = (anchor.y() - origin.y()) / max(1, old_size.height())
+        # 适应窗口可能低于 5%，此时缩小不应反向放大
+        minimum = min(0.05, self.zoom_scale)
+        self.zoom_scale = max(minimum, min(8.0, scale))
         self.update_image()
+        origin = self.image_label.mapTo(viewport, QPoint(0, 0))
+        for bar, delta in (
+            (self.scroll_area.horizontalScrollBar(),
+             origin.x() + relative_x * self.image_label.width() - anchor.x()),
+            (self.scroll_area.verticalScrollBar(),
+             origin.y() + relative_y * self.image_label.height() - anchor.y()),
+        ):
+            bar.setValue(bar.value() + round(delta))
 
     def zoom_fit(self):
-        """适应窗口"""
-        print(f'[调试] zoom_fit 被调用')
-        available_width = self.scroll_area.viewport().width() - 20
-        available_height = self.scroll_area.viewport().height() - 20
-        print(f'[调试] 可用区域大小: {available_width} x {available_height}')
-        print(f'[调试] 原始图片大小: {self.original_pixmap.width()} x {self.original_pixmap.height()}')
-
-        # 计算缩放比例
-        scale_w = available_width / self.original_pixmap.width()
-        scale_h = available_height / self.original_pixmap.height()
-        self.zoom_scale = min(scale_w, scale_h, 1.0)
-        print(f'[调试] 计算的缩放比例: scale_w={scale_w:.3f}, scale_h={scale_h:.3f}, 最终={self.zoom_scale:.3f}')
-
+        """根据旋转后的尺寸适应窗口"""
+        self.fit_mode = True
+        available_width = max(1, self.scroll_area.viewport().width() - 20)
+        available_height = max(1, self.scroll_area.viewport().height() - 20)
+        width, height = self.original_pixmap.width(), self.original_pixmap.height()
+        if self.rotation % 180:
+            width, height = height, width
+        self.zoom_scale = min(available_width / width, available_height / height, 1.0)
         self.update_image()
+
+    def refit_image(self):
+        if self.fit_mode:
+            self.zoom_fit()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.KeyPress and event.modifiers() == Qt.NoModifier:
+            if not isinstance(self.focusWidget(), QLineEdit):
+                if event.key() in (Qt.Key_Left, Qt.Key_Right):
+                    self.change_image(-1 if event.key() == Qt.Key_Left else 1)
+                    return True
+
+        viewport = self.scroll_area.viewport()
+        if watched not in (viewport, self.image_label):
+            return super().eventFilter(watched, event)
+        if event.type() == QEvent.Resize and watched is viewport:
+            if self.fit_mode and hasattr(self, 'fit_timer'):
+                self.fit_timer.start(0)
+        elif event.type() == QEvent.Wheel:
+            delta = event.angleDelta().y() or event.pixelDelta().y()
+            if delta:
+                anchor = viewport.mapFromGlobal(event.globalPosition().toPoint())
+                self.set_zoom(self.zoom_scale * (1.25 if delta > 0 else 1 / 1.25), anchor)
+            event.accept()
+            return True
+        elif event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            self.drag_position = event.globalPosition().toPoint()
+            self.scroll_area.setFocus()
+            for widget in (viewport, self.image_label):
+                widget.setCursor(Qt.ClosedHandCursor)
+            return True
+        elif event.type() == QEvent.MouseMove and self.drag_position is not None:
+            position = event.globalPosition().toPoint()
+            delta = position - self.drag_position
+            self.drag_position = position
+            hbar = self.scroll_area.horizontalScrollBar()
+            vbar = self.scroll_area.verticalScrollBar()
+            hbar.setValue(hbar.value() - delta.x())
+            vbar.setValue(vbar.value() - delta.y())
+            return True
+        elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            self.drag_position = None
+            for widget in (viewport, self.image_label):
+                widget.setCursor(Qt.OpenHandCursor)
+            return True
+        return super().eventFilter(watched, event)
 
     def zoom_actual(self):
         """实际大小"""
-        print(f'[调试] zoom_actual 被调用')
-        self.zoom_scale = 1.0
-        self.update_image()
+        self.set_zoom(1.0)
 
     def rotate_left(self):
         """逆时针旋转"""
         print(f'[调试] rotate_left 被调用')
         self.rotation = (self.rotation - 90) % 360
         print(f'[调试] 旋转角度变为: {self.rotation}')
-        self.update_image()
+        if self.fit_mode:
+            self.zoom_fit()
+        else:
+            self.update_image()
 
     def rotate_right(self):
         """顺时针旋转"""
         print(f'[调试] rotate_right 被调用')
         self.rotation = (self.rotation + 90) % 360
         print(f'[调试] 旋转角度变为: {self.rotation}')
-        self.update_image()
+        if self.fit_mode:
+            self.zoom_fit()
+        else:
+            self.update_image()
 
     def flip_horizontal(self):
         """水平翻转"""
@@ -383,6 +880,7 @@ class ImageViewerDialog(QDialog):
 
     def reset_transforms(self):
         """重置所有变换"""
+        self.fit_mode = False
         self.zoom_scale = 1.0
         self.rotation = 0
         self.flip_h = False
@@ -617,8 +1115,9 @@ class CustomCommandDialog(QDialog):
 
         self.btn_add_shortcut = QPushButton('➕')
         self.btn_add_shortcut.setMaximumWidth(40)
+        self.btn_add_shortcut.setProperty('compactButton', True)
         self.btn_add_shortcut.setToolTip('添加快捷命令')
-        self.btn_add_shortcut.setStyleSheet('QPushButton { background-color: #FF9800; color: white; font-weight: bold; padding: 8px; }')
+        self.btn_add_shortcut.setStyleSheet('QPushButton { background-color: #FF9800; color: white; font-weight: bold; padding: 4px 2px; }')
         self.btn_add_shortcut.clicked.connect(self.add_shortcut_command)
         button_layout.addWidget(self.btn_add_shortcut)
 
@@ -699,6 +1198,8 @@ class CustomCommandDialog(QDialog):
         """清空模组响应日志缓存"""
         global module_log_cache, full_log_cache, log_cache
 
+        if hasattr(self, 'clear_log_markers'):
+            self.clear_log_markers()
         print(f'[调试] 清空前 - module_log_cache长度: {len(module_log_cache)}, full_log_cache长度: {len(full_log_cache)}, log_cache长度: {len(log_cache)}')
 
         # 清空显示窗口
@@ -902,6 +1403,97 @@ class CustomCommandDialog(QDialog):
 # 图片数据类
 # ==============================
 
+class DownloadPerformance:
+    """只在主线程聚合下载计时，包级数据只保存计数/累计/最大值。"""
+
+    def __init__(self, image_type):
+        self.image_type = image_type
+        self.started = time.perf_counter()
+        self.stages = {}
+        self.metrics = {}
+        self.counts = {}
+        self.request_started = None
+        self.request_retried = False
+        self.handled_at = None
+        self.last_progress = self.started
+        self.baudrate = 1500000
+        self.packets = 0
+        self.bytes_received = 0
+
+    def mark(self, name):
+        self.stages[name] = time.perf_counter()
+
+    def add(self, name, seconds):
+        count, total, maximum = self.metrics.get(name, (0, 0.0, 0.0))
+        seconds = max(0.0, seconds)
+        self.metrics[name] = (count + 1, total + seconds, max(maximum, seconds))
+
+    def count(self, name):
+        self.counts[name] = self.counts.get(name, 0) + 1
+
+    def summary(self, outcome):
+        now = time.perf_counter()
+        lines = [f'[下载性能] {self.image_type.upper()} {outcome}，'
+                 f'全流程 {now - self.started:.3f}s，{self.bytes_received} 字节/{self.packets} 包']
+        previous = self.started
+        for key, label in (
+            ('high_baud', '高速波特率准备'), ('transfer', '获取大小/稳定等待'),
+            ('received', '数据传输'), ('split', '数据分离'),
+            ('saved', '目录创建/文件写入'), ('preview', '预览/历史更新'),
+            ('restore_sent', '恢复请求准备/发送'), ('restored', '恢复波特率'),
+        ):
+            if key in self.stages:
+                stamp = self.stages[key]
+                lines.append(f'[下载性能] 阶段 {label}: {(stamp - previous) * 1000:.2f}ms')
+                previous = stamp
+        if 'transfer' in self.stages:
+            seconds = max(1e-9, self.stages.get('received', now) - self.stages['transfer'])
+            rate = self.bytes_received / seconds
+            lines.append(f'[下载性能] 传输平均 {rate / 1024:.2f} KiB/s，'
+                         f'8N1 理论线路利用率 {rate / (self.baudrate / 10) * 100:.1f}% '
+                         f'（{self.baudrate}bps；含停等开销）')
+        for name, (count, total, maximum) in self.metrics.items():
+            lines.append(f'[下载性能] {name}: 样本 {count}，累计 {total * 1000:.2f}ms，'
+                         f'平均 {total / count * 1000:.2f}ms，最大 {maximum * 1000:.2f}ms')
+        lines.append('[下载性能] 异常计数: ' + (', '.join(
+            f'{name}={value}' for name, value in self.counts.items()) or '无'))
+        return lines
+
+
+class OtaPerformance(DownloadPerformance):
+    """复用计时聚合，OTA吞吐仅按成功确认的固件字节计算。"""
+
+    def __init__(self):
+        super().__init__('ota')
+
+    def summary(self, outcome):
+        now = time.perf_counter()
+        lines = [f'[OTA性能] {outcome}，全流程 {now - self.started:.3f}s，'
+                 f'已确认 {self.bytes_received} 字节/{self.packets} 包']
+        previous = self.started
+        for key, label in (
+            ('loaded', '读取固件'), ('transfer', '波特率/OTA准备/header'),
+            ('received', '固件传输'), ('burned', '模组烧录等待'),
+            ('ready', '模组重启等待'),
+        ):
+            if key in self.stages:
+                stamp = self.stages[key]
+                lines.append(f'[OTA性能] 阶段 {label}: {(stamp - previous) * 1000:.2f}ms')
+                previous = stamp
+        if 'transfer' in self.stages:
+            seconds = max(1e-9, self.stages.get('received', now) - self.stages['transfer'])
+            rate = self.bytes_received / seconds
+            lines.append(f'[OTA性能] 有效传输 {rate / 1024:.2f} KiB/s，'
+                         f'8N1理论线路利用率 {rate / (self.baudrate / 10) * 100:.1f}% '
+                         f'（{self.baudrate}bps）')
+        for name, (count, total, maximum) in self.metrics.items():
+            lines.append(f'[OTA性能] {name}: 样本 {count}，累计 {total * 1000:.2f}ms，'
+                         f'平均 {total / count * 1000:.2f}ms，最大 {maximum * 1000:.2f}ms')
+        lines.append('[OTA性能] 异常计数: ' + (', '.join(
+            f'{name}={value}' for name, value in self.counts.items()) or '无'))
+        return lines
+
+
 class ImageData:
     """图片数据类"""
     def __init__(self, folder_path, display_name=None):
@@ -968,11 +1560,12 @@ def serial_reader(port, baudrate, error_queue, connected_event=None, log_queue=N
                 line = line.lstrip()  # 清除前导空格
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                 log = f'[{timestamp}] {line}'
-                print(log)
-                log_cache.append(log)
-                full_log_cache.append(log)
-                if log_queue is not None:
-                    log_queue.put(log)
+                with log_cache_lock:
+                    log_cache.append(log)
+                    full_log_cache.append(log)
+                    log_index = len(full_log_cache) - 1
+                    if log_queue is not None:
+                        log_queue.put(QueuedLog(log_index, log))
             else:
                 time.sleep(0.01)
 
@@ -980,6 +1573,8 @@ def serial_reader(port, baudrate, error_queue, connected_event=None, log_queue=N
         print('串口异常:', e)
         error_queue.put(f'串口 {port} 已断开或无法访问：\n{e}')
     finally:
+        if connected_event is not None:
+            connected_event.clear()
         # 确保串口被关闭
         if ser is not None and ser.is_open:
             try:
@@ -1012,8 +1607,158 @@ class DownloadFolderHandler(FileSystemEventHandler):
             self.main_window.new_image_signal.emit(src_folder)
 
 # ==============================
-# 设置对话框
+# 日志打点与设置对话框
 # ==============================
+
+class LogMarkerWindow(QDialog):
+    """非模态日志打点工具窗；关闭时仅隐藏。"""
+
+    def __init__(self, main_window):
+        super().__init__(main_window, Qt.Tool)
+        self.main_window = main_window
+        self.setWindowTitle('📍 日志打点')
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.resize(720, 320)
+        self._updating = False
+
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        self.btn_mark_current = QPushButton('📍 当前打点')
+        self.btn_mark_current.clicked.connect(main_window.add_current_log_marker)
+        controls.addWidget(self.btn_mark_current)
+        self.btn_return_live = QPushButton('↩ 返回实时日志')
+        self.btn_return_live.clicked.connect(main_window.return_to_live_logs)
+        self.btn_return_live.setEnabled(False)
+        controls.addWidget(self.btn_return_live)
+        self.btn_delete = QPushButton('🗑️ 删除选中')
+        self.btn_delete.clicked.connect(self.delete_selected)
+        controls.addWidget(self.btn_delete)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(('名称', '时间', '日志总行数', '目标行号', '日志前10字符'))
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked |
+                                   QAbstractItemView.EditKeyPressed)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.itemChanged.connect(self.on_item_changed)
+        self.table.cellClicked.connect(self.on_row_clicked)
+        layout.addWidget(self.table)
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+
+    def refresh(self, selected_marker_id=None):
+        self._updating = True
+        try:
+            self.table.setRowCount(0)
+            selected_row = -1
+            for marker in self.main_window.log_markers:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                values = (
+                    marker.name,
+                    marker.created_at.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                    str(marker.log_count),
+                    str(marker.line_number),
+                    marker.summary,
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.UserRole, marker.marker_id)
+                    if column != 0:
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    self.table.setItem(row, column, item)
+                if marker.marker_id == selected_marker_id:
+                    selected_row = row
+            if selected_row >= 0:
+                self.table.selectRow(selected_row)
+                self.table.scrollToItem(self.table.item(selected_row, 0))
+        finally:
+            self._updating = False
+        self.update_history_state()
+
+    def update_history_state(self):
+        self.btn_return_live.setEnabled(self.main_window.log_history_marker_id is not None)
+
+    def marker_for_row(self, row):
+        item = self.table.item(row, 0)
+        if item is None:
+            return None
+        marker_id = item.data(Qt.UserRole)
+        return self.main_window.marker_by_id(marker_id)
+
+    def on_row_clicked(self, row, column):
+        marker = self.marker_for_row(row)
+        if marker:
+            self.main_window.show_marker_context(marker)
+
+    def on_item_changed(self, item):
+        if self._updating or item.column() != 0:
+            return
+        marker = self.main_window.marker_by_id(item.data(Qt.UserRole))
+        if marker is None:
+            return
+        name = item.text().strip()
+        if name:
+            marker.name = name
+        else:
+            self._updating = True
+            item.setText(marker.name)
+            self._updating = False
+
+    def delete_selected(self):
+        row = self.table.currentRow()
+        marker = self.marker_for_row(row) if row >= 0 else None
+        if marker:
+            self.main_window.delete_log_marker(marker.marker_id)
+
+
+class SaveLogDialog(QDialog):
+    """选择完整日志或从某次打点开始保存。"""
+
+    def __init__(self, markers, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('保存日志')
+        self.setMinimumWidth(470)
+        layout = QVBoxLayout(self)
+        range_layout = QHBoxLayout()
+        range_layout.addWidget(QLabel('保存范围:'))
+        self.range_combo = QComboBox()
+        self.range_combo.addItem('全部日志', None)
+        for marker in markers:
+            label = (f'{marker.name} · {marker.created_at.strftime("%H:%M:%S.%f")[:-3]} '
+                     f'· 第{marker.line_number}行')
+            self.range_combo.addItem(label, marker.marker_id)
+        range_layout.addWidget(self.range_combo, 1)
+        layout.addLayout(range_layout)
+        remark_layout = QHBoxLayout()
+        remark_layout.addWidget(QLabel('备注（可选）:'))
+        self.remark_input = QLineEdit()
+        remark_layout.addWidget(self.remark_input, 1)
+        layout.addLayout(remark_layout)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText('保存')
+        buttons.button(QDialogButtonBox.Cancel).setText('取消')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_marker_id(self):
+        return self.range_combo.currentData()
+
+    def remark(self):
+        return self.remark_input.text().strip()
+
 
 class SettingsDialog(QDialog):
     """设置对话框"""
@@ -1076,6 +1821,9 @@ class SettingsDialog(QDialog):
         btn_output.clicked.connect(lambda: self.browse_directory_combo(self.output_combo))
         output_layout.addWidget(btn_output)
         test_layout.addLayout(output_layout)
+
+        for button in (btn_download, btn_program, btn_output):
+            button.setProperty('compactButton', True)
 
         version_layout = QHBoxLayout()
         version_layout.addWidget(QLabel('测试版本:'))
@@ -1148,6 +1896,7 @@ class MainWindow(QMainWindow):
         self.log_queue = queue.Queue()
         self.send_queue = queue.Queue()
         self.connected_event = threading.Event()
+        self.log_connection_notified = False
         self.serial_thread = None
 
         # 模组串口相关
@@ -1167,11 +1916,11 @@ class MainWindow(QMainWindow):
         self.download_offset = 0  # 当前下载偏移量
         self.download_total_size = 0  # 总下载大小
         self.is_downloading = False  # 是否正在下载
+        self.download_perf = None
         self.last_upload_command = b''  # 最后一次上传指令（用于重传）
         self.retry_timer = None  # 重传定时器
         self.download_type = 'jpeg'  # 下载类型：'jpeg' 或 'raw'
         self.raw_mode = 'Y+IR'  # RAW图模式：'Y+RGB'(40%+60%) 或 'Y+IR'(50%+50%)
-        self.next_request_sent = False  # 标记是否已提前发送下一个请求
         self.pending_command = None  # 等待响应的指令（msg_id, retry_count）
         self.command_timeout_timer = None  # 指令超时定时器
 
@@ -1193,6 +1942,9 @@ class MainWindow(QMainWindow):
         self.ota_stage = 0  # OTA阶段：0=未开始, 1=设置波特率, 2=进入OTA, 3=发送header, 4=发送固件包, 5=等待烧录完成
         self.ota_retry_timer = None  # OTA超时重传定时器
         self.ota_retry_count = 0  # 当前包的重传次数
+        self.ota_perf = None
+        self.ota_step_timer = None
+        self.ota_waiting_ack = False
 
         # 待机相关
         self.is_standby_restoring = False  # 是否正在待机恢复波特率
@@ -1223,6 +1975,15 @@ class MainWindow(QMainWindow):
 
         # 主题模式
         self.dark_mode = False
+
+        # 日志打点与历史上下文（仅当前运行会话）
+        self.log_markers = []
+        self.next_log_marker_id = 1
+        self.log_marker_window = None
+        self.log_history_marker_id = None
+        self.log_history_start = None
+        self.log_history_target_row = None
+        self.log_marker_selection = None
 
         # 连接超时定时器
         self.connection_timeout_timer = None
@@ -1263,8 +2024,12 @@ class MainWindow(QMainWindow):
         self.port_combo.setMinimumWidth(100)
         serial_config_layout.addWidget(self.port_combo)
 
-        btn_refresh = QPushButton('🔄')
-        btn_refresh.setMaximumWidth(30)
+        btn_refresh = QPushButton()
+        btn_refresh.setObjectName('refreshPortsButton')
+        btn_refresh.setProperty('compactButton', True)
+        btn_refresh.setIconSize(QSize(16, 16))
+        btn_refresh.setFixedSize(30, 28)
+        btn_refresh.setAccessibleName('刷新日志串口列表')
         btn_refresh.setToolTip('刷新串口列表')
         btn_refresh.clicked.connect(self.refresh_ports)
         serial_config_layout.addWidget(btn_refresh)
@@ -1282,67 +2047,66 @@ class MainWindow(QMainWindow):
         self.btn_connect.setStyleSheet('QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 12px; }')
         serial_config_layout.addWidget(self.btn_connect)
 
+        self.btn_more_functions = QPushButton('☰ 更多功能')
+        self.btn_more_functions.setAccessibleName('日志工具更多功能')
+        self.btn_more_functions.setToolTip('设置、图片监控、日志保存和主题')
+        self.main_functions_menu = QMenu(self.btn_more_functions)
+        self.action_settings = self.main_functions_menu.addAction('⚙️ 参数设置')
+        self.action_monitor = self.main_functions_menu.addAction('👁️ 启用图片监控')
+        self.action_log_markers = self.main_functions_menu.addAction('📍 日志打点')
+        self.main_functions_menu.addSeparator()
+        self.action_save_log = self.main_functions_menu.addAction('💾 保存日志')
+        self.action_open_output = self.main_functions_menu.addAction('📂 打开保存目录')
+        self.main_functions_menu.addSeparator()
+        self.action_theme = self.main_functions_menu.addAction('🌙 切换至深色模式')
+        self.action_settings.triggered.connect(self.open_settings_dialog)
+        self.action_monitor.triggered.connect(self.toggle_monitoring)
+        self.action_log_markers.triggered.connect(self.show_log_marker_window)
+        self.action_save_log.triggered.connect(self.save_log_only)
+        self.action_open_output.triggered.connect(self.open_output_directory)
+        self.action_theme.triggered.connect(self.toggle_theme)
+        self.btn_more_functions.setMenu(self.main_functions_menu)
+        serial_config_layout.addWidget(self.btn_more_functions)
         serial_config_layout.addStretch()
 
         left_layout.addLayout(serial_config_layout)
 
-        # 工具栏（紧凑）
-        toolbar_layout = QHBoxLayout()
-
-        self.btn_settings = QPushButton('⚙️ 设置')
-        self.btn_settings.clicked.connect(self.open_settings_dialog)
-        toolbar_layout.addWidget(self.btn_settings)
-
-        self.btn_monitor = QPushButton('👁️ 启用监控')
-        self.btn_monitor.clicked.connect(self.toggle_monitoring)
-        toolbar_layout.addWidget(self.btn_monitor)
-
-        btn_save_log = QPushButton('💾 保存日志')
-        btn_save_log.clicked.connect(self.save_log_only)
-        toolbar_layout.addWidget(btn_save_log)
-
-        self.btn_open_output = QPushButton('📂 打开保存目录')
-        self.btn_open_output.clicked.connect(self.open_output_directory)
-        toolbar_layout.addWidget(self.btn_open_output)
-
-        self.btn_theme = QPushButton('🌙 深色模式')
-        self.btn_theme.clicked.connect(self.toggle_theme)
-        toolbar_layout.addWidget(self.btn_theme)
-
-        toolbar_layout.addStretch()
-
-        left_layout.addLayout(toolbar_layout)
-
         # 刷新串口列表
         self.refresh_ports()
+        self.set_status('● 未连接', '#999999')
 
-        # 状态栏
-        status_layout = QHBoxLayout()
-        self.status_label = QLabel('● 未连接')
-        self.status_label.setStyleSheet('font-size: 11pt; font-weight: bold; color: #999999;')
-        status_layout.addWidget(self.status_label)
-        status_layout.addStretch()
-
-        self.monitor_status_label = QLabel('监控: 未启用')
-        self.monitor_status_label.setStyleSheet('font-size: 9pt; color: #666666;')
-        status_layout.addWidget(self.monitor_status_label)
-
-        left_layout.addLayout(status_layout)
-
-        # 日志显示区
-        log_group = QGroupBox('📋 串口日志')
-        log_layout = QVBoxLayout(log_group)
+        # 日志显示区直接进入左侧布局，省去标题框占用的空间
+        log_layout = QVBoxLayout()
+        log_layout.setContentsMargins(0, 0, 0, 0)
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        self.log_text.setUndoRedoEnabled(False)
+        # 最后一块为空行，额外保留一块以显示配置数量的逻辑日志
+        self.log_text.document().setMaximumBlockCount(LOG_DISPLAY_MAX_LINES + 1)
         self.log_text.setFont(QFont('Consolas', 9))
+        self.log_text.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.log_text.customContextMenuRequested.connect(self.show_log_context_menu)
         log_layout.addWidget(self.log_text)
+
+        self.log_history_bar = QWidget()
+        history_layout = QHBoxLayout(self.log_history_bar)
+        history_layout.setContentsMargins(5, 3, 5, 3)
+        self.log_history_label = QLabel()
+        history_layout.addWidget(self.log_history_label)
+        history_layout.addStretch()
+        btn_return_live = QPushButton('↩ 返回实时日志')
+        btn_return_live.clicked.connect(self.return_to_live_logs)
+        history_layout.addWidget(btn_return_live)
+        log_layout.addWidget(self.log_history_bar)
+        self.log_history_bar.setVisible(False)
 
         # 嵌入式搜索栏（默认隐藏）
         self.search_bar = QWidget()
+        self.search_bar.setObjectName('logSearchBar')
         search_bar_layout = QHBoxLayout(self.search_bar)
         search_bar_layout.setContentsMargins(5, 5, 5, 5)
-        self.search_bar.setStyleSheet('QWidget { background-color: #f0f0f0; border: 1px solid #ccc; }')
+        self.search_bar.setStyleSheet('QWidget#logSearchBar { background-color: #f0f0f0; border: 1px solid #ccc; }')
 
         search_bar_layout.addWidget(QLabel('🔍'))
 
@@ -1386,12 +2150,16 @@ class MainWindow(QMainWindow):
         btn_close_search.clicked.connect(self.hide_search_bar)
         search_bar_layout.addWidget(btn_close_search)
 
+        for button in (btn_prev, btn_next, btn_close_search):
+            button.setProperty('compactButton', True)
+
         log_layout.addWidget(self.search_bar)
         self.search_bar.setVisible(False)
 
         # 搜索相关变量
         self.search_matches = []
         self.current_match_index = -1
+        self.search_extra_selections = []
 
         # 日志工具栏
         log_tool_layout = QHBoxLayout()
@@ -1399,6 +2167,11 @@ class MainWindow(QMainWindow):
         btn_clear = QPushButton('🗑️ 清空')
         btn_clear.clicked.connect(self.clear_module_logs)
         log_tool_layout.addWidget(btn_clear)
+
+        self.btn_more_log_viewers = QPushButton('📖 更多查看方式')
+        self.btn_more_log_viewers.setToolTip('将完整日志快照交给本机文本编辑器查看')
+        self.btn_more_log_viewers.clicked.connect(self.show_full_log_viewer_menu)
+        log_tool_layout.addWidget(self.btn_more_log_viewers)
 
         log_tool_layout.addStretch()
 
@@ -1408,14 +2181,14 @@ class MainWindow(QMainWindow):
 
         log_layout.addLayout(log_tool_layout)
 
-        left_layout.addWidget(log_group)
+        left_layout.addLayout(log_layout, 1)
 
         # 快速发送区（可折叠）
         send_outer_layout = QVBoxLayout()
 
         # 标题栏和折叠按钮
         send_header_layout = QHBoxLayout()
-        self.btn_toggle_send = QPushButton('▼ 📤 快速发送')
+        self.btn_toggle_send = QPushButton('▶ 📤 快速发送')
         self.btn_toggle_send.clicked.connect(self.toggle_send_group)
         send_header_layout.addWidget(self.btn_toggle_send)
         send_header_layout.addStretch()
@@ -1423,6 +2196,7 @@ class MainWindow(QMainWindow):
 
         # 可折叠的快速发送内容区域
         self.send_content_widget = QWidget()
+        self.send_content_widget.setVisible(False)
         send_group = QGroupBox()
         send_layout = QVBoxLayout(send_group)
         self.send_content_widget.setLayout(QVBoxLayout())
@@ -1451,6 +2225,7 @@ class MainWindow(QMainWindow):
         # 添加快捷命令按钮
         btn_add_shortcut = QPushButton('➕')
         btn_add_shortcut.setMaximumWidth(30)
+        btn_add_shortcut.setProperty('compactButton', True)
         btn_add_shortcut.setToolTip('添加快捷命令')
         btn_add_shortcut.setStyleSheet('QPushButton { font-weight: bold; padding: 2px; }')
         btn_add_shortcut.clicked.connect(self.add_quick_command)
@@ -1544,6 +2319,11 @@ class MainWindow(QMainWindow):
         self.image_info_label.setWordWrap(True)
         preview_layout.addWidget(self.image_info_label)
 
+        self.monitor_status_label = QLabel('图片监控：未启用')
+        self.monitor_status_label.setObjectName('monitorStatusLabel')
+        self.monitor_status_label.setStyleSheet('font-size: 9pt; color: #666666; padding: 0 5px 4px 5px;')
+        preview_layout.addWidget(self.monitor_status_label)
+
         right_layout.addWidget(preview_group)
 
         # === 模组控制区域 ===
@@ -1554,6 +2334,14 @@ class MainWindow(QMainWindow):
         self.btn_toggle_module = QPushButton('▼ 🔧 模组控制')
         self.btn_toggle_module.clicked.connect(self.toggle_module_group)
         module_header_layout.addWidget(self.btn_toggle_module)
+
+        self.btn_module_modes = QPushButton('⚙️ 模式设置')
+        self.btn_module_modes.setAccessibleName('模组模式设置')
+        self.btn_module_modes.setToolTip('设置操作、RAW、项目、停止条件和重复次数')
+        self.module_modes_menu = QMenu(self.btn_module_modes)
+        self.btn_module_modes.setMenu(self.module_modes_menu)
+        self.setup_module_modes_menu()
+        module_header_layout.addWidget(self.btn_module_modes)
         module_header_layout.addStretch()
         module_outer_layout.addLayout(module_header_layout)
 
@@ -1565,107 +2353,7 @@ class MainWindow(QMainWindow):
         self.module_content_widget.layout().setContentsMargins(0, 0, 0, 0)
         self.module_content_widget.layout().addWidget(module_group)
 
-        # 模式选择（人脸/手掌）
-        mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel('模式选择:'))
-
-        # 创建人脸/手掌模式按钮组
-        self.mode_button_group = QButtonGroup(self)
-
-        self.face_mode_radio = QRadioButton('👤 人脸模式')
-        self.face_mode_radio.setChecked(True)  # 默认选中人脸模式
-        self.mode_button_group.addButton(self.face_mode_radio)
-        mode_layout.addWidget(self.face_mode_radio)
-
-        self.palm_mode_radio = QRadioButton('🖐️ 手掌模式')
-        self.mode_button_group.addButton(self.palm_mode_radio)
-        mode_layout.addWidget(self.palm_mode_radio)
-
-        mode_layout.addStretch()
-
-        # RAW图模式选择
-        mode_layout.addWidget(QLabel('RAW模式:'))
-
-        self.raw_mode_button_group = QButtonGroup(self)
-
-        self.raw_y_rgb_radio = QRadioButton('Y+RGB')
-        self.raw_y_rgb_radio.setToolTip('第一张图40%，第二张图60%')
-        self.raw_mode_button_group.addButton(self.raw_y_rgb_radio)
-        mode_layout.addWidget(self.raw_y_rgb_radio)
-
-        self.raw_y_ir_radio = QRadioButton('Y+IR')
-        self.raw_y_ir_radio.setChecked(True)  # 默认选中Y+IR
-        self.raw_y_ir_radio.setToolTip('第一张图50%，第二张图50%')
-        self.raw_mode_button_group.addButton(self.raw_y_ir_radio)
-        mode_layout.addWidget(self.raw_y_ir_radio)
-
-        # 连接信号
-        self.raw_y_rgb_radio.toggled.connect(self.on_raw_mode_changed)
-
-        mode_layout.addWidget(QLabel('  '))  # 添加一点间距
-
-        # 添加重复次数输入
-        mode_layout.addWidget(QLabel('重复次数:'))
-        self.repeat_count_spin = QSpinBox()
-        self.repeat_count_spin.setMinimum(1)
-        self.repeat_count_spin.setMaximum(1000)
-        self.repeat_count_spin.setValue(1)
-        self.repeat_count_spin.setFixedWidth(80)
-        self.repeat_count_spin.setToolTip('注册/识别指令的重复执行次数')
-        mode_layout.addWidget(self.repeat_count_spin)
-
-        module_layout.addLayout(mode_layout)
-
-        # 第二行：项目模式和停止条件
-        second_row_layout = QHBoxLayout()
-
-        # 项目模式选择（DSM/KDS）
-        second_row_layout.addWidget(QLabel('项目模式:'))
-
-        # 创建DSM/KDS项目模式按钮组
-        self.project_button_group = QButtonGroup(self)
-
-        self.dsm_mode_radio = QRadioButton('DSM')
-        self.dsm_mode_radio.setChecked(True)  # 默认选中DSM模式
-        self.project_button_group.addButton(self.dsm_mode_radio)
-        second_row_layout.addWidget(self.dsm_mode_radio)
-
-        self.kds_mode_radio = QRadioButton('KDS')
-        self.project_button_group.addButton(self.kds_mode_radio)
-        second_row_layout.addWidget(self.kds_mode_radio)
-
-        second_row_layout.addWidget(QLabel('  '))  # 添加一点间距
-
-        # 停止条件选择
-        second_row_layout.addWidget(QLabel('停止条件:'))
-
-        self.stop_condition_button_group = QButtonGroup(self)
-
-        self.stop_none_radio = QRadioButton('不停止')
-        self.stop_none_radio.setChecked(True)  # 默认不停止
-        self.stop_none_radio.setToolTip('执行完所有重复次数')
-        self.stop_condition_button_group.addButton(self.stop_none_radio)
-        second_row_layout.addWidget(self.stop_none_radio)
-
-        self.stop_on_fail_radio = QRadioButton('失败停止')
-        self.stop_on_fail_radio.setToolTip('当某次注册或识别失败时，自动停止重复执行')
-        self.stop_condition_button_group.addButton(self.stop_on_fail_radio)
-        second_row_layout.addWidget(self.stop_on_fail_radio)
-
-        self.stop_on_success_radio = QRadioButton('成功停止')
-        self.stop_on_success_radio.setToolTip('当某次注册或识别成功时，自动停止重复执行')
-        self.stop_condition_button_group.addButton(self.stop_on_success_radio)
-        second_row_layout.addWidget(self.stop_on_success_radio)
-
-        second_row_layout.addStretch()
-        module_layout.addLayout(second_row_layout)
-
-        # 分隔线
-        line_mode = QFrame()
-        line_mode.setFrameShape(QFrame.HLine)
-        line_mode.setFrameShadow(QFrame.Sunken)
-        module_layout.addWidget(line_mode)
-
+        # 模式选择移至标题右侧菜单，展开内容直接从串口配置开始
         # 模组串口配置
         module_serial_layout = QHBoxLayout()
         module_serial_layout.addWidget(QLabel('模组串口:'))
@@ -1674,8 +2362,12 @@ class MainWindow(QMainWindow):
         self.module_port_combo.setMinimumWidth(100)
         module_serial_layout.addWidget(self.module_port_combo)
 
-        btn_refresh_module = QPushButton('🔄')
-        btn_refresh_module.setMaximumWidth(30)
+        btn_refresh_module = QPushButton()
+        btn_refresh_module.setObjectName('refreshModulePortsButton')
+        btn_refresh_module.setProperty('compactButton', True)
+        btn_refresh_module.setIconSize(QSize(16, 16))
+        btn_refresh_module.setFixedSize(30, 28)
+        btn_refresh_module.setAccessibleName('刷新模组串口列表')
         btn_refresh_module.setToolTip('刷新串口列表')
         btn_refresh_module.clicked.connect(self.refresh_module_ports)
         module_serial_layout.addWidget(btn_refresh_module)
@@ -1935,22 +2627,20 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(module_outer_layout)
 
         # === 自动执行序列区域 ===
-        sequence_group = QGroupBox('🔄 自动执行序列')
-        sequence_outer_layout = QVBoxLayout(sequence_group)
+        sequence_outer_layout = QVBoxLayout()
 
-        # 添加折叠/展开按钮
+        # 标题本身作为折叠入口，与模组控制区域一致
         sequence_header_layout = QHBoxLayout()
-        self.btn_toggle_sequence = QPushButton('▼ 折叠')
-        self.btn_toggle_sequence.setMaximumWidth(80)
+        self.btn_toggle_sequence = QPushButton('▶ 🔄 自动执行序列')
         self.btn_toggle_sequence.clicked.connect(self.toggle_sequence_panel)
         sequence_header_layout.addWidget(self.btn_toggle_sequence)
         sequence_header_layout.addStretch()
         sequence_outer_layout.addLayout(sequence_header_layout)
 
         # 序列内容容器
-        self.sequence_content_widget = QWidget()
+        self.sequence_content_widget = QGroupBox()
+        self.sequence_content_widget.setVisible(False)
         sequence_layout = QVBoxLayout(self.sequence_content_widget)
-        sequence_layout.setContentsMargins(0, 0, 0, 0)
 
         # 操作选择和添加
         add_layout = QHBoxLayout()
@@ -2044,25 +2734,23 @@ class MainWindow(QMainWindow):
 
         # 将序列内容添加到外层布局
         sequence_outer_layout.addWidget(self.sequence_content_widget)
-        right_layout.addWidget(sequence_group)
+        right_layout.addLayout(sequence_outer_layout)
 
         # === 保存控制区域 ===
-        save_group = QGroupBox('💾 保存控制')
-        save_layout = QVBoxLayout(save_group)
+        save_layout = QVBoxLayout()
 
-        # 添加折叠/展开按钮
+        # 标题本身作为折叠入口，与模组控制区域一致
         save_header_layout = QHBoxLayout()
-        self.btn_toggle_save = QPushButton('▼ 折叠')
-        self.btn_toggle_save.setMaximumWidth(80)
+        self.btn_toggle_save = QPushButton('▶ 💾 保存控制')
         self.btn_toggle_save.clicked.connect(self.toggle_save_panel)
         save_header_layout.addWidget(self.btn_toggle_save)
         save_header_layout.addStretch()
         save_layout.addLayout(save_header_layout)
 
         # 保存控制内容容器
-        self.save_content_widget = QWidget()
+        self.save_content_widget = QGroupBox()
+        self.save_content_widget.setVisible(False)
         save_content_layout = QVBoxLayout(self.save_content_widget)
-        save_content_layout.setContentsMargins(0, 0, 0, 0)
 
         # 测试信息输入（按照命名规则顺序）
         form_layout = QVBoxLayout()
@@ -2233,7 +2921,7 @@ class MainWindow(QMainWindow):
         # 将内容容器添加到保存布局
         save_layout.addWidget(self.save_content_widget)
 
-        right_layout.addWidget(save_group)
+        right_layout.addLayout(save_layout)
 
         # 将右侧widget设置到滚动区域
         right_scroll.setWidget(right_widget)
@@ -2304,6 +2992,8 @@ class MainWindow(QMainWindow):
         """清空模组响应日志缓存"""
         global module_log_cache, full_log_cache, log_cache
 
+        if hasattr(self, 'clear_log_markers'):
+            self.clear_log_markers()
         print(f'[调试] 清空前 - module_log_cache长度: {len(module_log_cache)}, full_log_cache长度: {len(full_log_cache)}, log_cache长度: {len(log_cache)}')
 
         # 清空显示窗口
@@ -2328,12 +3018,80 @@ class MainWindow(QMainWindow):
         self.module_response_text.clear()
         print('[调试] 已清空模组响应信息显示')
 
-    def on_raw_mode_changed(self, checked):
+    def _add_exclusive_mode_menu(self, title, items, checked_key):
+        """创建带勾选状态的互斥模式子菜单。"""
+        menu = self.module_modes_menu.addMenu(title)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        actions = {}
+        for key, text in items:
+            action = menu.addAction(text)
+            action.setCheckable(True)
+            action.setData(key)
+            group.addAction(action)
+            actions[key] = action
+        actions[checked_key].setChecked(True)
+        group.triggered.connect(self.update_module_mode_summary)
+        return menu, group, actions
+
+    def setup_module_modes_menu(self):
+        """构建模组模式菜单，作为模式状态的唯一UI来源。"""
+        _, self.operation_mode_group, self.operation_mode_actions = \
+            self._add_exclusive_mode_menu(
+                '操作模式', (('face', '👤 人脸模式'), ('palm', '🖐️ 手掌模式')), 'face'
+            )
+        _, self.raw_mode_action_group, self.raw_mode_actions = \
+            self._add_exclusive_mode_menu(
+                'RAW 模式', (('Y+RGB', 'Y+RGB（40% + 60%）'),
+                             ('Y+IR', 'Y+IR（50% + 50%）')), 'Y+IR'
+            )
+        _, self.project_mode_group, self.project_mode_actions = \
+            self._add_exclusive_mode_menu(
+                '项目模式', (('DSM', 'DSM'), ('KDS', 'KDS')), 'DSM'
+            )
+        _, self.stop_condition_group, self.stop_condition_actions = \
+            self._add_exclusive_mode_menu(
+                '停止条件', (('none', '不停止'), ('fail', '失败停止'),
+                             ('success', '成功停止')), 'none'
+            )
+        self.raw_mode_action_group.triggered.connect(self.on_raw_mode_changed)
+
+        self.module_modes_menu.addSeparator()
+        repeat_action = QWidgetAction(self.module_modes_menu)
+        repeat_widget = QWidget(self.module_modes_menu)
+        repeat_layout = QHBoxLayout(repeat_widget)
+        repeat_layout.setContentsMargins(10, 4, 10, 4)
+        repeat_layout.addWidget(QLabel('重复次数:'))
+        self.repeat_count_spin = QSpinBox(repeat_widget)
+        self.repeat_count_spin.setRange(1, 1000)
+        self.repeat_count_spin.setValue(1)
+        self.repeat_count_spin.setFixedWidth(90)
+        self.repeat_count_spin.setToolTip('注册/识别指令的重复执行次数')
+        self.repeat_count_spin.valueChanged.connect(self.update_module_mode_summary)
+        repeat_layout.addWidget(self.repeat_count_spin)
+        repeat_action.setDefaultWidget(repeat_widget)
+        self.module_modes_menu.addAction(repeat_action)
+        self.update_module_mode_summary()
+
+    @staticmethod
+    def _checked_action_key(actions):
+        return next(key for key, action in actions.items() if action.isChecked())
+
+    def update_module_mode_summary(self, checked=None):
+        """同步模式按钮摘要和提示。"""
+        operation = '人脸' if self.operation_mode_actions['face'].isChecked() else '手掌'
+        raw = self._checked_action_key(self.raw_mode_actions)
+        project = self._checked_action_key(self.project_mode_actions)
+        stop_names = {'none': '不停止', 'fail': '失败停止', 'success': '成功停止'}
+        stop = stop_names[self._checked_action_key(self.stop_condition_actions)]
+        summary = f'{operation} · {raw} · {project} · {stop} · {self.repeat_count_spin.value()}次'
+        self.btn_module_modes.setToolTip(summary)
+        self.btn_module_modes.setAccessibleDescription(summary)
+
+    def on_raw_mode_changed(self, action=None):
         """RAW模式切换"""
-        if checked:
-            self.raw_mode = 'Y+RGB'
-        else:
-            self.raw_mode = 'Y+IR'
+        self.raw_mode = self._checked_action_key(self.raw_mode_actions)
+        self.update_module_mode_summary()
         print(f'[调试] RAW模式切换为: {self.raw_mode}')
 
     def connect_serial(self):
@@ -2430,6 +3188,7 @@ class MainWindow(QMainWindow):
             self.serial_thread = None
 
             # 重置下载相关标志位
+            self.end_download_performance('中止（断开连接）')
             self.is_downloading = False
             self.download_buffer = bytearray()
             self.download_offset = 0
@@ -2533,7 +3292,7 @@ class MainWindow(QMainWindow):
                     self.observer.stop()
                     self.observer.join()
                 self.start_observer()
-                self.monitor_status_label.setText(f'监控: {os.path.basename(self.download_dir)}')
+                self.monitor_status_label.setText(f'图片监控：{os.path.basename(self.download_dir)}')
 
             # 每次应用都启动上位机程序（如果配置了）
             if self.host_program:
@@ -2551,25 +3310,15 @@ class MainWindow(QMainWindow):
 
     def toggle_save_panel(self):
         """折叠/展开保存控制面板"""
-        if self.save_content_widget.isVisible():
-            # 折叠
-            self.save_content_widget.setVisible(False)
-            self.btn_toggle_save.setText('▶ 展开')
-        else:
-            # 展开
-            self.save_content_widget.setVisible(True)
-            self.btn_toggle_save.setText('▼ 折叠')
+        expanded = self.save_content_widget.isHidden()
+        self.save_content_widget.setVisible(expanded)
+        self.btn_toggle_save.setText('▼ 💾 保存控制' if expanded else '▶ 💾 保存控制')
 
     def toggle_sequence_panel(self):
         """折叠/展开自动执行序列面板"""
-        if self.sequence_content_widget.isVisible():
-            # 折叠
-            self.sequence_content_widget.setVisible(False)
-            self.btn_toggle_sequence.setText('▶ 展开')
-        else:
-            # 展开
-            self.sequence_content_widget.setVisible(True)
-            self.btn_toggle_sequence.setText('▼ 折叠')
+        expanded = self.sequence_content_widget.isHidden()
+        self.sequence_content_widget.setVisible(expanded)
+        self.btn_toggle_sequence.setText('▼ 🔄 自动执行序列' if expanded else '▶ 🔄 自动执行序列')
 
     def check_repeat_next(self, last_success=None):
         """检查是否需要继续重复执行下一次
@@ -2591,10 +3340,10 @@ class MainWindow(QMainWindow):
         should_stop = False
         stop_reason = ''
 
-        if last_success is True and self.stop_on_success_radio.isChecked():
+        if last_success is True and self.stop_condition_actions['success'].isChecked():
             should_stop = True
             stop_reason = '检测到成功，触发成功停止'
-        elif last_success is False and self.stop_on_fail_radio.isChecked():
+        elif last_success is False and self.stop_condition_actions['fail'].isChecked():
             should_stop = True
             stop_reason = '检测到失败，触发失败停止'
 
@@ -2986,8 +3735,8 @@ class MainWindow(QMainWindow):
                 self.observer = None
 
             self.monitoring_enabled = False
-            self.btn_monitor.setText('👁️ 启用监控')
-            self.monitor_status_label.setText('监控: 未启用')
+            self.action_monitor.setText('👁️ 启用图片监控')
+            self.monitor_status_label.setText('图片监控：未启用')
             self.monitor_status_label.setStyleSheet('font-size: 9pt; color: #666666;')
         else:
             # 加载配置
@@ -3030,16 +3779,192 @@ class MainWindow(QMainWindow):
             self.start_observer()
 
             self.monitoring_enabled = True
-            self.btn_monitor.setText('👁️ 停止监控')
-            self.monitor_status_label.setText(f'监控: {os.path.basename(download_dir)}')
+            self.action_monitor.setText('👁️ 停止图片监控')
+            self.monitor_status_label.setText(f'图片监控：{os.path.basename(download_dir)}')
             self.monitor_status_label.setStyleSheet('font-size: 9pt; color: #2e8b57;')
 
             # 启动上位机程序
             self.launch_host_program()
 
+    def marker_by_id(self, marker_id):
+        return next((marker for marker in self.log_markers
+                     if marker.marker_id == marker_id), None)
+
+    def show_log_marker_window(self, selected_marker_id=None):
+        """显示非模态打点窗口，首次停靠在日志区右上角。"""
+        first_show = self.log_marker_window is None
+        if first_show:
+            self.log_marker_window = LogMarkerWindow(self)
+        self.log_marker_window.refresh(selected_marker_id)
+        if first_show:
+            top_right = self.log_text.mapToGlobal(self.log_text.rect().topRight())
+            x = max(0, top_right.x() - self.log_marker_window.width())
+            self.log_marker_window.move(x, top_right.y())
+        self.log_marker_window.show()
+        self.log_marker_window.raise_()
+        self.log_marker_window.activateWindow()
+
+    def add_log_marker(self, log_index):
+        """为完整日志绝对索引创建打点。"""
+        with log_cache_lock:
+            if not full_log_cache:
+                QMessageBox.information(self, '提示', '当前还没有产生任何日志')
+                return None
+            log_index = max(0, min(int(log_index), len(full_log_cache) - 1))
+            log_count = len(full_log_cache)
+            line_text = full_log_cache[log_index]
+        marker_id = self.next_log_marker_id
+        marker = LogMarker(
+            marker_id=marker_id,
+            name=f'记录{marker_id}',
+            created_at=datetime.now(),
+            log_index=log_index,
+            log_count=log_count,
+            line_text=line_text,
+        )
+        self.next_log_marker_id += 1
+        self.log_markers.append(marker)
+        self.show_log_marker_window(marker.marker_id)
+        return marker
+
+    def add_current_log_marker(self):
+        """绑定点击瞬间最新采集到完整缓存的日志行。"""
+        with log_cache_lock:
+            index = len(full_log_cache) - 1
+        return self.add_log_marker(index)
+
+    def visible_log_block_count(self):
+        """返回文档内真实日志块数量，排除末尾空块。"""
+        document = self.log_text.document()
+        count = document.blockCount()
+        last = document.lastBlock()
+        if last.isValid() and not last.text():
+            count -= 1
+        return max(0, count)
+
+    def log_index_at_position(self, position):
+        """把日志控件坐标映射到完整缓存绝对索引。"""
+        block_count = self.visible_log_block_count()
+        if block_count <= 0:
+            return None
+        cursor = self.log_text.cursorForPosition(position)
+        block_number = min(cursor.blockNumber(), block_count - 1)
+        block = self.log_text.document().findBlockByNumber(block_number)
+        data = block.userData() if block.isValid() else None
+        if isinstance(data, LogBlockData) and data.log_index is not None:
+            return data.log_index if 0 <= data.log_index < len(full_log_cache) else None
+        return None
+
+    def show_log_context_menu(self, position):
+        menu = self.log_text.createStandardContextMenu()
+        menu.addSeparator()
+        marker_action = menu.addAction('📍 在此行打点')
+        index = self.log_index_at_position(position)
+        marker_action.setEnabled(index is not None)
+        if index is not None:
+            marker_action.triggered.connect(
+                lambda checked=False, line_index=index: self.add_log_marker(line_index)
+            )
+        menu.exec(self.log_text.mapToGlobal(position))
+
+    def delete_log_marker(self, marker_id):
+        marker = self.marker_by_id(marker_id)
+        if marker is None:
+            return
+        self.log_markers.remove(marker)
+        if self.log_history_marker_id == marker_id:
+            self.return_to_live_logs()
+        if self.log_marker_window:
+            self.log_marker_window.refresh()
+
+    def clear_log_markers(self):
+        self.log_markers.clear()
+        self.next_log_marker_id = 1
+        self.log_history_marker_id = None
+        self.log_history_start = None
+        self.log_history_target_row = None
+        self.log_marker_selection = None
+        if hasattr(self, 'log_history_bar'):
+            self.log_history_bar.setVisible(False)
+        if self.log_marker_window:
+            self.log_marker_window.refresh()
+
+    def show_marker_context(self, marker):
+        """主日志切换到打点前后各100行，并高亮目标行。"""
+        with log_cache_lock:
+            logs_snapshot = list(full_log_cache)
+        if not logs_snapshot or marker.log_index >= len(logs_snapshot):
+            QMessageBox.warning(self, '提示', '该打点对应的日志已经不可用')
+            return
+        start = max(0, marker.log_index - 100)
+        end = min(len(logs_snapshot), marker.log_index + 101)
+        self.log_history_marker_id = marker.marker_id
+        self.log_history_start = start
+        self.log_history_target_row = marker.log_index - start
+        self.log_history_label.setText(
+            f'正在查看第 {marker.line_number} 行附近的历史日志（{marker.name}）'
+        )
+        self.log_history_bar.setVisible(True)
+        self.render_log_snapshot(logs_snapshot[start:end], self.log_history_target_row,
+                                 start_index=start)
+        if self.log_marker_window:
+            self.log_marker_window.update_history_state()
+
+    def render_log_snapshot(self, lines, target_row=None, start_index=None):
+        """重绘一个日志快照，必要时高亮目标整行。"""
+        if start_index is not None:
+            lines = [QueuedLog(start_index + offset, text)
+                     for offset, text in enumerate(lines)]
+        self.log_text.clear()
+        self.append_logs(lines, scroll_to_end=target_row is None)
+        self.log_marker_selection = None
+        if target_row is not None:
+            block = self.log_text.document().findBlockByNumber(target_row)
+            if block.isValid():
+                selection = QTextEdit.ExtraSelection()
+                selection.cursor = QTextCursor(block)
+                selection.cursor.movePosition(QTextCursor.EndOfBlock,
+                                              QTextCursor.KeepAnchor)
+                selection.format.setBackground(QColor('#FF8C42'))
+                selection.format.setForeground(QColor('#FFFFFF'))
+                self.log_marker_selection = selection
+                self.log_text.setTextCursor(selection.cursor)
+                self.log_text.ensureCursorVisible()
+        self.apply_log_extra_selections()
+
+    def apply_log_extra_selections(self, search_selections=None):
+        """合并搜索与打点高亮，避免两者互相清除。"""
+        if search_selections is not None:
+            self.search_extra_selections = search_selections
+        selections = list(getattr(self, 'search_extra_selections', []))
+        if self.log_marker_selection is not None:
+            selections.append(self.log_marker_selection)
+        self.log_text.setExtraSelections(selections)
+
+    def return_to_live_logs(self):
+        """退出历史上下文并恢复完整缓存尾部的实时视图。"""
+        self.log_history_marker_id = None
+        self.log_history_start = None
+        self.log_history_target_row = None
+        self.log_marker_selection = None
+        self.log_history_bar.setVisible(False)
+        with log_cache_lock:
+            total_count = len(full_log_cache)
+            logs_snapshot = list(full_log_cache[-LOG_DISPLAY_MAX_LINES:])
+            while not self.log_queue.empty():
+                try:
+                    self.log_queue.get_nowait()
+                except queue.Empty:
+                    break
+        start_index = max(0, total_count - len(logs_snapshot))
+        self.render_log_snapshot(logs_snapshot, start_index=start_index)
+        if self.log_marker_window:
+            self.log_marker_window.update_history_state()
+
     def start_serial(self):
         """启动串口线程"""
         self.connected_event.clear()
+        self.log_connection_notified = False
         self.serial_thread = threading.Thread(
             target=serial_reader,
             args=(self.port, self.baudrate, self.error_queue, self.connected_event, self.log_queue, self.send_queue),
@@ -3058,194 +3983,127 @@ class MainWindow(QMainWindow):
         """启动定时器"""
         self.log_timer = QTimer()
         self.log_timer.timeout.connect(self.poll_log_queue)
-        self.log_timer.start(200)
+        self.log_timer.start(LOG_POLL_INTERVAL_MS)
 
         self.error_timer = QTimer()
         self.error_timer.timeout.connect(self.poll_error_queue)
         self.error_timer.start(500)
 
-    def append_log(self, text):
-        """追加日志（带语法高亮）"""
+    def get_log_formats(self):
+        """仅在主题变化时重建格式，避免逐行构造颜色和格式对象。"""
+        if getattr(self, '_log_format_theme', None) != self.dark_mode:
+            colors = LOG_HIGHLIGHT_COLORS[self.dark_mode]
+            formats = {}
+            for name, color in colors.items():
+                if name == 'background':
+                    continue
+                fmt = QTextCharFormat()
+                fmt.setBackground(QColor(colors['background']))
+                fmt.setForeground(QColor(color))
+                formats[name] = fmt
+            self._log_formats = formats
+            self._log_format_theme = self.dark_mode
+        return self._log_formats
+
+    def insert_log_line(self, cursor, text, formats, log_index=None):
+        """使用批次共享的光标插入一行；保持原有高亮重叠规则。"""
+        block = cursor.block()
+        block.setUserData(LogBlockData(log_index))
         try:
-            import re
-
-            # 保存当前光标位置
-            cursor = self.log_text.textCursor()
-            cursor.movePosition(QTextCursor.End)
-
-            # 定义颜色方案（浅色模式和深色模式）
-            if self.dark_mode:
-                colors = {
-                   'timestamp': "#87CEEB",      # 深蓝 - 时间戳
-                    'bracket': '#216AAF',        # 蓝灰色 - 括号
-                    'number': '#098658',         # 深绿 - 数字
-                    'hex': '#78E22E',            # 黄绿色 - 十六进制
-                    'keyword': '#87CEEB',        # 蓝色 - 关键字（成功等）
-                    'keyword_err': '#EC5800',    # 深红色 - 错误关键字
-                    'symbol': '#41B9EF',          # 浅灰 - 符号
-                    'text': '#F8F9FA',           # 浅灰 - 普通文本
-                    'upper_letter': '#FFB6C1',    # 橙色 - 全大写字母
-                    'background': '#1e1e1e'
-                }
-            else:
-                colors = {
-                    'timestamp': '#0066CC',      # 深蓝 - 时间戳
-                    'bracket': '#216AAF',        # 蓝灰色 - 括号
-                    'number': '#098658',         # 深绿 - 数字
-                    'hex': '#78E22E',            # 黄绿色 - 十六进制
-                    'keyword': '#0000FF',        # 蓝色 - 关键字（成功等）
-                    'keyword_err': '#A31515',    # 深红色 - 错误关键字
-                    'symbol': '#41B9EF',         # 青色 - 符号
-                    'text': '#000000',           # 黑色 - 普通文本
-                    'upper_letter': '#EC5800',   # 橙色 - 全大写字母
-                    'background': 'white'
-                }
-
-            # 解析并着色日志
-            # 匹配时间戳：[2024-01-01 12:34:56.789]
-            timestamp_pattern = r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\]'
-            # 匹配十六进制：0x1234, AA, 55, EF 等
-            hex_pattern = r'\b0x[0-9A-Fa-f]+\b'
-            # 匹配数字：123, 456 等
-            number_pattern = r'\b\d+\b'
-            # 匹配关键字
-            keyword_pattern = r'\b(成功|warning|success|connected|发送|接收|下载)\b'
-            keyword_pattern_err = r'\b(失败|错误|error|failed|timeout|disconnected)\b'
-            # 匹配括号和符号
-            bracket_pattern = r'[\[\](){}]'
-            symbol_pattern = r'[,:;=<>+\-*/]'
-            upper_letter_pattern = r'\b[A-Z]+\b'
-
-            # 创建一个统一的模式，并标记类型
-            patterns = [
-                ('timestamp', timestamp_pattern),
-                ('hex', hex_pattern),
-                ('number', number_pattern),
-                ('keyword', keyword_pattern),
-                ('bracket', bracket_pattern),
-                ('symbol', symbol_pattern),
-                ('keyword_err', keyword_pattern_err),
-                ('upper_letter', upper_letter_pattern),
-            ]
-
-            # 找到所有匹配项及其位置
             matches = []
-            for color_type, pattern in patterns:
-                # 只对关键字使用忽略大小写，其他保持大小写敏感
-                if color_type in ['keyword', 'keyword_err']:
-                    flags = re.IGNORECASE
-                else:
-                    flags = 0
-                for match in re.finditer(pattern, text, flags):
-                    matches.append((match.start(), match.end(), color_type))
+            for color_type, pattern, priority in LOG_HIGHLIGHT_RULES:
+                for match in pattern.finditer(text):
+                    matches.append((match.start(), match.end(), color_type, priority))
+            matches.sort(key=lambda item: item[0])
 
-            # 按位置排序
-            matches.sort(key=lambda x: x[0])
-
-            # 合并重叠的匹配（优先级：timestamp > keyword > keyword_err > hex > upper_letter > number > bracket > symbol）
-            priority = {
-                'timestamp': 8,
-                'keyword': 7,
-                'keyword_err': 6,
-                'hex': 5,
-                'upper_letter': 4,
-                'number': 3,
-                'bracket': 2,
-                'symbol': 1
-            }
             filtered_matches = []
             last_end = 0
-            for start, end, color_type in matches:
+            for start, end, color_type, priority in matches:
                 if start >= last_end:
-                    filtered_matches.append((start, end, color_type))
+                    filtered_matches.append((start, end, color_type, priority))
                     last_end = end
-                elif priority.get(color_type, 0) > priority.get(filtered_matches[-1][2], 0):
-                    # 如果当前匹配优先级更高，替换前一个
-                    if filtered_matches and filtered_matches[-1][0] == start:
-                        filtered_matches[-1] = (start, end, color_type)
-                        last_end = end
-
-            # 插入带颜色的文本
-            pos = 0
-            for start, end, color_type in filtered_matches:
-                # 插入未匹配部分（普通文本）
-                if pos < start:
-                    format = cursor.charFormat()
-                    format.clearBackground()
-                    format.setBackground(QColor(colors['background']))
-                    format.setForeground(QColor(colors['text']))
-                    cursor.setCharFormat(format)
-                    cursor.insertText(text[pos:start])
-
-                # 插入匹配部分（带颜色）
-                format = cursor.charFormat()
-                format.clearBackground()
-                format.setBackground(QColor(colors['background']))
-                format.setForeground(QColor(colors[color_type]))
-                cursor.setCharFormat(format)
-                cursor.insertText(text[start:end])
-
-                pos = end
-
-            # 插入剩余部分
-            if pos < len(text):
-                format = cursor.charFormat()
-                format.clearBackground()
-                format.setBackground(QColor(colors['background']))
-                format.setForeground(QColor(colors['text']))
-                cursor.setCharFormat(format)
-                cursor.insertText(text[pos:])
-
-            # 插入换行
-            cursor.insertText('\n')
-
+                elif (filtered_matches[-1][0] == start
+                      and priority > filtered_matches[-1][3]):
+                    filtered_matches[-1] = (start, end, color_type, priority)
+                    last_end = end
         except Exception as e:
-            # 如果语法高亮失败，使用简单模式显示
+            # 在插入前完成解析，失败回退时不会重复已经插入的文本。
             print(f'[错误] 日志着色失败: {e}，使用简单模式')
-            cursor = self.log_text.textCursor()
-            cursor.movePosition(QTextCursor.End)
-            format = cursor.charFormat()
-            format.clearBackground()
-            if self.dark_mode:
-                format.setBackground(QColor('#1e1e1e'))
-                format.setForeground(QColor('#e0e0e0'))
-            else:
-                format.setBackground(QColor('white'))
-                format.setForeground(QColor('black'))
-            cursor.setCharFormat(format)
-            cursor.insertText(text + '\n')
+            cursor.insertText(text + '\n', formats['text'])
+            return
 
-        # 更新日志计数
-        self.log_count_label.setText(f'日志行数: {len(full_log_cache)}')
+        pos = 0
+        for start, end, color_type, _ in filtered_matches:
+            if pos < start:
+                cursor.insertText(text[pos:start], formats['text'])
+            cursor.insertText(text[start:end], formats[color_type])
+            pos = end
+        cursor.insertText(text[pos:] + '\n', formats['text'])
 
-        # 限制显示行数
-        document = self.log_text.document()
-        if document.lineCount() > 2000:
-            cursor = QTextCursor(document)
-            cursor.movePosition(QTextCursor.Start)
-            for _ in range(document.lineCount() - 2000):
-                cursor.select(QTextCursor.LineUnderCursor)
-                cursor.removeSelectedText()
-                cursor.deleteChar()
+    def append_logs(self, lines, scroll_to_end=True):
+        """批量插入；迭代器可在每行渲染后检查预算，未消费的日志留在队列。"""
+        lines = iter(lines)
+        try:
+            first_line = next(lines)
+        except StopIteration:
+            return
 
-        # 滚动到底部
-        self.log_text.moveCursor(QTextCursor.End)
+        formats = self.get_log_formats()
+        cursor = QTextCursor(self.log_text.document())
+        cursor.movePosition(QTextCursor.End)
+        updates_enabled = self.log_text.updatesEnabled()
+        self.log_text.setUpdatesEnabled(False)
+        cursor.beginEditBlock()
+        try:
+            first_text = first_line.text if isinstance(first_line, QueuedLog) else first_line
+            first_index = first_line.log_index if isinstance(first_line, QueuedLog) else None
+            self.insert_log_line(cursor, first_text, formats, first_index)
+            for line in lines:
+                text = line.text if isinstance(line, QueuedLog) else line
+                log_index = line.log_index if isinstance(line, QueuedLog) else None
+                self.insert_log_line(cursor, text, formats, log_index)
+        finally:
+            try:
+                cursor.endEditBlock()
+                self.log_count_label.setText(f'日志行数: {len(full_log_cache)}')
+                if scroll_to_end:
+                    self.log_text.moveCursor(QTextCursor.End)
+            finally:
+                self.log_text.setUpdatesEnabled(updates_enabled)
+
+    def append_log(self, text):
+        """单条入口供系统提示和信号调用，复用批量渲染。"""
+        self.append_logs((text,))
 
     def set_status(self, text, color):
-        """设置状态"""
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(f'font-size: 11pt; font-weight: bold; color: {color};')
+        """保存日志串口状态；紧凑布局中通过连接按钮提示而不另占一行。"""
+        self.log_connection_status = text
+        if hasattr(self, 'btn_connect'):
+            self.btn_connect.setToolTip(f'日志串口状态：{text.lstrip("● ")}')
+            self.btn_connect.setAccessibleDescription(text)
 
     def poll_log_queue(self):
-        """轮询日志队列"""
-        while True:
-            try:
-                line = self.log_queue.get_nowait()
-                self.log_signal.emit(line)
-                if self.connected_event.is_set():
-                    self.connected_signal.emit()
-            except queue.Empty:
-                break
+        """独立检查串口连接状态，再处理日志；无日志也能完成连接。"""
+        if self.connected_event.is_set() and not self.log_connection_notified:
+            self.log_connection_notified = True
+            self.connected_signal.emit()
+
+        # 历史上下文保持稳定；实时数据仍已进入完整缓存和原队列。
+        if getattr(self, 'log_history_marker_id', None) is not None:
+            return
+
+        def pending_lines():
+            started = time.perf_counter()
+            for index in range(LOG_BATCH_MAX_LINES):
+                # yield返回后已完成该行渲染，预算包含解析/插入耗时。
+                if index and time.perf_counter() - started >= LOG_BATCH_BUDGET_SECONDS:
+                    break
+                try:
+                    yield self.log_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+        self.append_logs(pending_lines())
 
     def poll_error_queue(self):
         """轮询错误队列"""
@@ -3310,6 +4168,8 @@ class MainWindow(QMainWindow):
 
     def handle_error(self, msg):
         """处理错误"""
+        if self.connection_timeout_timer:
+            self.connection_timeout_timer.stop()
         self.connected_event.clear()
         self.set_status('● 已断开', '#c0392b')
         self.append_log(f'[系统] {msg}')
@@ -3366,18 +4226,21 @@ class MainWindow(QMainWindow):
 
     def display_images(self, folder_path):
         """显示图片（水平排列）"""
-        # 清空之前的图片
-        while self.image_layout.count():
-            item = self.image_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
         # 查找图片文件
         image_files = []
         for root, dirs, files in os.walk(folder_path):
             for file in files:
                 if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
                     image_files.append(os.path.join(root, file))
+
+        self.display_image_previews(image_files[:10])
+
+    def display_image_previews(self, image_files):
+        """统一缩略图和双击入口，每次查看器使用当前组的图片快照"""
+        while self.image_layout.count():
+            item = self.image_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
         if not image_files:
             label = QLabel('该文件夹中没有找到图片文件')
@@ -3391,8 +4254,9 @@ class MainWindow(QMainWindow):
         h_layout.setSpacing(10)
         h_layout.setAlignment(Qt.AlignCenter)
 
-        # 显示图片（最多10张，水平排列）
-        for img_path in image_files[:10]:
+        preview_paths = []
+        # 保留实际显示的图片及顺序，排除无法加载的文件
+        for img_path in image_files:
             try:
                 pixmap = QPixmap(img_path)
                 if not pixmap.isNull():
@@ -3412,7 +4276,10 @@ class MainWindow(QMainWindow):
                     img_label.setProperty('image_path', img_path)
 
                     # 双击事件
-                    img_label.mouseDoubleClickEvent = lambda event, path=img_path: self.open_image_viewer(path)
+                    img_label.mouseDoubleClickEvent = (
+                        lambda event, path=img_path: self.open_image_viewer(path, preview_paths)
+                    )
+                    preview_paths.append(img_path)
 
                     # 创建垂直容器（图片+文件名）
                     v_container = QWidget()
@@ -3436,84 +4303,20 @@ class MainWindow(QMainWindow):
         h_container.setLayout(h_layout)
         self.image_layout.addWidget(h_container)
 
-    def open_image_viewer(self, image_path):
+    def open_image_viewer(self, image_path, image_paths=None):
         """打开图片查看器窗口"""
         try:
-            viewer = ImageViewerDialog(image_path, self)
-            viewer.exec()
+            viewer = ImageViewerDialog(image_path, self, image_paths=image_paths)
+            try:
+                viewer.exec()
+            finally:
+                viewer.deleteLater()
         except Exception as e:
             QMessageBox.warning(self, '错误', f'打开图片查看器失败：\n{str(e)}')
 
     def display_downloaded_images(self, image1_path, image2_path):
         """显示下载的两张图片（水平并排）"""
-        # 清空之前的图片
-        while self.image_layout.count():
-            item = self.image_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        # 创建水平布局容器
-        h_layout = QHBoxLayout()
-        h_layout.setSpacing(10)
-
-        # 显示第一张图片
-        try:
-            pixmap1 = QPixmap(image1_path)
-            if not pixmap1.isNull():
-                # 缩放图片（250x250）
-                scaled_pixmap1 = pixmap1.scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-                img_label1 = QLabel()
-                img_label1.setPixmap(scaled_pixmap1)
-                img_label1.setAlignment(Qt.AlignCenter)
-                img_label1.setStyleSheet('border: 1px solid #ddd; padding: 5px; background: white;')
-
-                # 创建垂直容器（图片+文件名）
-                v_container1 = QWidget()
-                v_layout1 = QVBoxLayout(v_container1)
-                v_layout1.setContentsMargins(0, 0, 0, 0)
-                v_layout1.addWidget(img_label1)
-
-                name_label1 = QLabel(os.path.basename(image1_path))
-                name_label1.setAlignment(Qt.AlignCenter)
-                name_label1.setStyleSheet('color: #666666; font-size: 9pt;')
-                v_layout1.addWidget(name_label1)
-
-                h_layout.addWidget(v_container1)
-        except Exception as e:
-            print(f'加载图片1失败: {image1_path}, {e}')
-
-        # 显示第二张图片
-        try:
-            pixmap2 = QPixmap(image2_path)
-            if not pixmap2.isNull():
-                # 缩放图片（250x250）
-                scaled_pixmap2 = pixmap2.scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-                img_label2 = QLabel()
-                img_label2.setPixmap(scaled_pixmap2)
-                img_label2.setAlignment(Qt.AlignCenter)
-                img_label2.setStyleSheet('border: 1px solid #ddd; padding: 5px; background: white;')
-
-                # 创建垂直容器（图片+文件名）
-                v_container2 = QWidget()
-                v_layout2 = QVBoxLayout(v_container2)
-                v_layout2.setContentsMargins(0, 0, 0, 0)
-                v_layout2.addWidget(img_label2)
-
-                name_label2 = QLabel(os.path.basename(image2_path))
-                name_label2.setAlignment(Qt.AlignCenter)
-                name_label2.setStyleSheet('color: #666666; font-size: 9pt;')
-                v_layout2.addWidget(name_label2)
-
-                h_layout.addWidget(v_container2)
-        except Exception as e:
-            print(f'加载图片2失败: {image2_path}, {e}')
-
-        # 将水平布局添加到主布局
-        h_container = QWidget()
-        h_container.setLayout(h_layout)
-        self.image_layout.addWidget(h_container)
+        self.display_image_previews([path for path in (image1_path, image2_path) if path])
 
         # 启用保存按钮
         self.btn_save_current.setEnabled(True)
@@ -3821,39 +4624,122 @@ class MainWindow(QMainWindow):
 
             self.image_info_label.setText('路径: 无')
 
+    def show_full_log_viewer_menu(self):
+        """按当前安装情况展示完整日志的外部查看方式。"""
+        if not full_log_cache:
+            QMessageBox.information(self, '提示', '当前还没有产生任何日志')
+            return
+        try:
+            viewers = discover_text_viewers()
+        except Exception as error:
+            viewers = []
+            QMessageBox.warning(self, '提示', f'读取本机文本编辑器列表失败：\n{error}')
+
+        menu = QMenu(self)
+        for viewer in viewers:
+            action = menu.addAction(viewer.name)
+            action.setToolTip(viewer.executable)
+            action.triggered.connect(
+                lambda checked=False, selected=viewer: self.open_full_log_with_viewer(selected)
+            )
+        if viewers:
+            menu.addSeparator()
+        open_with_action = menu.addAction('选择其他程序（系统“打开方式…”）')
+        open_with_action.triggered.connect(self.open_full_log_with_system_dialog)
+        folder_action = menu.addAction('导出临时文件并打开所在位置')
+        folder_action.triggered.connect(self.reveal_full_log_snapshot)
+        menu.popup(self.btn_more_log_viewers.mapToGlobal(
+            self.btn_more_log_viewers.rect().bottomLeft()
+        ))
+        self._full_log_viewer_menu = menu
+
+    def _create_full_log_snapshot_or_warn(self):
+        try:
+            return create_full_log_snapshot()
+        except ValueError as error:
+            QMessageBox.information(self, '提示', str(error))
+        except OSError as error:
+            QMessageBox.critical(self, '错误', f'导出完整日志失败：\n{error}')
+        return None
+
+    def open_full_log_with_viewer(self, viewer):
+        """生成快照后用选定的本地编辑器打开。"""
+        path = self._create_full_log_snapshot_or_warn()
+        if path is None:
+            return
+        try:
+            subprocess.Popen(viewer_command(viewer, path), shell=False)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self, '错误', f'无法使用 {viewer.name} 打开完整日志：\n{error}'
+            )
+
+    def open_full_log_with_system_dialog(self):
+        """生成快照后交给Windows原生“打开方式”选择器。"""
+        path = self._create_full_log_snapshot_or_warn()
+        if path is None:
+            return
+        try:
+            show_windows_open_with(path, int(self.winId()))
+        except OSError as error:
+            QMessageBox.critical(self, '错误', f'无法显示系统“打开方式”：\n{error}')
+
+    def reveal_full_log_snapshot(self):
+        """生成快照并在资源管理器中选中文件。"""
+        path = self._create_full_log_snapshot_or_warn()
+        if path is None:
+            return
+        try:
+            if sys.platform == 'win32':
+                subprocess.Popen(['explorer.exe', '/select,', str(path)], shell=False)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', '-R', str(path)])
+            else:
+                subprocess.Popen(['xdg-open', str(path.parent)])
+        except OSError as error:
+            QMessageBox.critical(self, '错误', f'无法打开日志所在位置：\n{error}')
+
     def save_log_only(self):
-        """仅保存日志"""
+        """保存全部日志或从选定打点开始的日志，并追加适用打点信息。"""
         if not full_log_cache:
             QMessageBox.information(self, '提示', '当前还没有产生任何日志')
             return
 
-        # 简单对话框
-        remark, ok = QInputDialog.getText(self, '保存日志', '备注（可选）:')
-
-        if not ok:
+        dialog = SaveLogDialog(self.log_markers, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected_marker = self.marker_by_id(dialog.selected_marker_id())
+        start_index = selected_marker.log_index if selected_marker else 0
+        with log_cache_lock:
+            logs_snapshot = list(full_log_cache)
+        if start_index >= len(logs_snapshot):
+            QMessageBox.warning(self, '提示', '选定打点对应的日志已经不可用')
             return
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        if remark:
-            name = f'{remark}_{timestamp}'
-        else:
-            name = timestamp
-
+        remark = dialog.remark()
+        name = f'{remark}_{timestamp}' if remark else timestamp
         dst_folder = os.path.join(self.output if self.output else './result', name)
-
         if os.path.exists(dst_folder):
             dst_folder += '_' + datetime.now().strftime('%H%M%S')
 
-        os.makedirs(dst_folder, exist_ok=True)
+        start_marker_id = selected_marker.marker_id if selected_marker else None
+        text = build_marked_log_text(
+            logs_snapshot, list(self.log_markers), start_index, start_marker_id
+        )
+        try:
+            os.makedirs(dst_folder, exist_ok=True)
+            log_file = os.path.join(dst_folder, 'log.txt')
+            with open(log_file, 'w', encoding='utf-8', newline='') as stream:
+                stream.write(text)
+        except OSError as error:
+            QMessageBox.critical(self, '保存失败', f'写入日志失败：\n{error}')
+            return
 
-        logs_to_save = extract_logs('all')
-
-        log_file = os.path.join(dst_folder, 'log.txt')
-        with open(log_file, 'w', encoding='utf-8') as f:
-            for line in logs_to_save:
-                f.write(line + "\n")
-
-        QMessageBox.information(self, '保存成功', f'已保存 {len(logs_to_save)} 行日志至:\n{dst_folder}')
+        saved_count = len(logs_snapshot) - start_index
+        QMessageBox.information(
+            self, '保存成功', f'已保存 {saved_count} 行日志至:\n{dst_folder}'
+        )
 
     def quick_send(self):
         """快速发送"""
@@ -3935,27 +4821,40 @@ class MainWindow(QMainWindow):
 
         if self.dark_mode:
             self.apply_dark_theme()
-            self.btn_theme.setText('☀️ 浅色模式')
+            self.action_theme.setText('☀️ 切换至浅色模式')
         else:
             self.apply_light_theme()
-            self.btn_theme.setText('🌙 深色模式')
+            self.action_theme.setText('🌙 切换至深色模式')
 
         # 重新渲染所有日志以应用新主题的颜色
         self.rerender_all_logs()
 
     def rerender_all_logs(self):
         """重新渲染所有日志（切换主题时调用）"""
-        # 保存当前日志内容
-        logs_to_rerender = []
-        for log_line in full_log_cache:
-            logs_to_rerender.append(log_line)
-
-        # 清空日志显示
-        self.log_text.clear()
-
-        # 重新渲染每一行
-        for log_line in logs_to_rerender:
-            self.append_log(log_line)
+        if getattr(self, 'log_history_marker_id', None) is not None:
+            marker = self.marker_by_id(self.log_history_marker_id)
+            if marker is not None:
+                with log_cache_lock:
+                    logs_snapshot = list(full_log_cache)
+                start = max(0, marker.log_index - 100)
+                end = min(len(logs_snapshot), marker.log_index + 101)
+                self.log_history_start = start
+                self.log_history_target_row = marker.log_index - start
+                self.render_log_snapshot(logs_snapshot[start:end],
+                                         self.log_history_target_row,
+                                         start_index=start)
+        else:
+            # 只重绘已显示的逻辑行，同时保留每块绑定的完整缓存绝对索引。
+            logs_to_rerender = []
+            block = self.log_text.document().firstBlock()
+            while block.isValid():
+                if block.text() or block.next().isValid():
+                    data = block.userData()
+                    index = data.log_index if isinstance(data, LogBlockData) else None
+                    logs_to_rerender.append(QueuedLog(index, block.text()))
+                block = block.next()
+            self.log_text.clear()
+            self.append_logs(logs_to_rerender)
 
         # 重新渲染模组响应日志
         module_logs_to_rerender = []
@@ -3994,6 +4893,14 @@ class MainWindow(QMainWindow):
 
         self.module_response_text.moveCursor(QTextCursor.End)
 
+    def update_theme_icons(self, dark_mode):
+        """刷新按钮使用矢量图标，不受系统emoji字体和运行目录影响。"""
+        icon = QIcon(':/theme/refresh_dark.svg' if dark_mode else ':/theme/refresh_light.svg')
+        for name in ('refreshPortsButton', 'refreshModulePortsButton'):
+            button = self.findChild(QPushButton, name)
+            if button is not None:
+                button.setIcon(icon)
+
     def apply_dark_theme(self):
         """应用深色主题"""
         # 主窗口样式
@@ -4030,6 +4937,35 @@ class MainWindow(QMainWindow):
             QPushButton:pressed {
                 background-color: #353535;
             }
+            QPushButton[compactButton="true"] {
+                padding: 4px 2px;
+                min-width: 24px;
+            }
+            QPushButton:disabled {
+                color: #777777;
+            }
+            QMenu {
+                background-color: #353535;
+                color: #e0e0e0;
+                border: 1px solid #555555;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 28px 6px 24px;
+                border-radius: 2px;
+            }
+            QMenu::item:selected {
+                background-color: #0078d7;
+                color: white;
+            }
+            QMenu::item:disabled {
+                color: #777777;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #555555;
+                margin: 4px 8px;
+            }
             QLineEdit, QComboBox, QSpinBox {
                 background-color: #353535;
                 color: #e0e0e0;
@@ -4062,20 +4998,80 @@ class MainWindow(QMainWindow):
             QScrollArea QLabel {
                 background-color: transparent;
             }
-            QComboBox::drop-down {
+            QComboBox, QSpinBox {
+                padding: 4px 28px 4px 6px;
+                min-height: 18px;
+            }
+            QComboBox QLineEdit, QSpinBox QLineEdit {
+                background: transparent;
                 border: none;
+                padding: 0;
+            }
+            QComboBox:disabled, QSpinBox:disabled, QLineEdit:disabled {
+                color: #777777;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 24px;
+                border: none;
+                border-left: 1px solid #555555;
+                background-color: #404040;
+                border-top-right-radius: 3px;
+                border-bottom-right-radius: 3px;
+            }
+            QComboBox::drop-down:hover, QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #4a4a4a;
             }
             QComboBox::down-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 5px solid #e0e0e0;
+                image: url(:/theme/down.svg);
+                width: 12px;
+                height: 8px;
+            }
+            QComboBox::down-arrow:disabled {
+                image: url(:/theme/down_disabled.svg);
+            }
+            QComboBox QAbstractItemView {
+                background-color: #353535;
+                color: #e0e0e0;
+                border: 1px solid #555555;
+                selection-background-color: #0078d7;
+                selection-color: white;
+                outline: none;
             }
             QSpinBox::up-button, QSpinBox::down-button {
+                subcontrol-origin: border;
+                width: 22px;
                 background-color: #404040;
                 border: 1px solid #555555;
             }
+            QSpinBox::up-button {
+                subcontrol-position: top right;
+                border-top-right-radius: 3px;
+            }
+            QSpinBox::down-button {
+                subcontrol-position: bottom right;
+                border-bottom-right-radius: 3px;
+            }
+            QSpinBox::up-arrow {
+                image: url(:/theme/up.svg);
+                width: 10px;
+                height: 6px;
+            }
+            QSpinBox::down-arrow {
+                image: url(:/theme/down.svg);
+                width: 10px;
+                height: 6px;
+            }
+            QSpinBox::up-arrow:disabled, QSpinBox::up-arrow:off {
+                image: url(:/theme/up_disabled.svg);
+            }
+            QSpinBox::down-arrow:disabled, QSpinBox::down-arrow:off {
+                image: url(:/theme/down_disabled.svg);
+            }
         ''')
+
+        self.update_theme_icons(True)
 
         # 日志文本特殊处理
         self.log_text.setStyleSheet('''
@@ -4087,7 +5083,7 @@ class MainWindow(QMainWindow):
         ''')
 
         # 搜索栏样式
-        self.search_bar.setStyleSheet('QWidget { background-color: #353535; border: 1px solid #555555; }')
+        self.search_bar.setStyleSheet('QWidget#logSearchBar { background-color: #353535; border: 1px solid #555555; }')
 
         # 状态标签保持原有颜色逻辑，只调整默认色
         # 其他动态颜色（连接状态等）保持不变
@@ -4096,8 +5092,9 @@ class MainWindow(QMainWindow):
         """应用浅色主题"""
         # 清除所有自定义样式，恢复默认
         self.setStyleSheet('')
+        self.update_theme_icons(False)
         self.log_text.setStyleSheet('')
-        self.search_bar.setStyleSheet('QWidget { background-color: #f0f0f0; border: 1px solid #ccc; }')
+        self.search_bar.setStyleSheet('QWidget#logSearchBar { background-color: #f0f0f0; border: 1px solid #ccc; }')
 
     def launch_host_program(self):
         """启动上位机程序"""
@@ -4212,14 +5209,14 @@ class MainWindow(QMainWindow):
             extra_selections.append(selection)
 
         # 应用所有高亮
-        self.log_text.setExtraSelections(extra_selections)
+        self.apply_log_extra_selections(extra_selections)
 
         print(f'[调试-搜索] find_all_matches 完成，共找到 {match_count} 个匹配项')
 
     def clear_search_highlights(self):
-        """清除搜索高亮（使用额外格式，不影响原有颜色）"""
-        # 使用 ExtraSelections 来清除高亮，这样不会影响原有的文字颜色
-        self.log_text.setExtraSelections([])
+        """清除搜索高亮但保留打点目标高亮。"""
+        self.search_extra_selections = []
+        self.apply_log_extra_selections()
 
     def highlight_current_match(self):
         """高亮当前匹配项（使用 ExtraSelections）"""
@@ -4253,7 +5250,7 @@ class MainWindow(QMainWindow):
             extra_selections.append(selection)
 
         # 应用所有高亮
-        self.log_text.setExtraSelections(extra_selections)
+        self.apply_log_extra_selections(extra_selections)
 
         # 移动光标到当前匹配位置
         match_position = self.search_matches[self.current_match_index]
@@ -4379,7 +5376,8 @@ class MainWindow(QMainWindow):
             self.module_receive_thread.start()
 
             # 启动响应轮询定时器
-            self.module_response_timer = QTimer()
+            self.module_response_timer = QTimer(self)
+            self.module_response_timer.setTimerType(Qt.PreciseTimer)
             self.module_response_timer.timeout.connect(self.poll_module_response)
             self.module_response_timer.start(100)
 
@@ -4432,6 +5430,9 @@ class MainWindow(QMainWindow):
                 self.module_response_timer.stop()
 
             # 重置下载相关标志位（防止下载卡死后重新连接无法下载）
+            if getattr(self, 'ota_in_progress', False) or getattr(self, 'ota_perf', None):
+                self.finish_ota('中止（断开模组）')
+            self.end_download_performance('中止（断开模组）')
             self.is_downloading = False
             self.download_buffer = bytearray()
             self.download_offset = 0
@@ -4484,10 +5485,13 @@ class MainWindow(QMainWindow):
                 # pyserial会在有数据时立即返回，或超时后返回实际读到的字节
                 header = self.module_serial.read(5)
                 if len(header) < 5:
-                    continue  # 超时或数据不完整，重新读取
+                    if header:
+                        self.module_response_queue.put(('receive_stat', '头部短读', time.perf_counter()))
+                    continue  # 无数据的空闲超时不计入错误
 
                 sync = header[0:2]
                 if sync != b'\xEF\xAA':
+                    self.module_response_queue.put(('receive_stat', '同步头不匹配', time.perf_counter()))
                     continue
 
                 msg_type = header[2:3]
@@ -4497,7 +5501,9 @@ class MainWindow(QMainWindow):
                 # 阻塞读取数据和校验和（data_size + 1字节）
                 # 不需要手动轮询in_waiting，read()会高效等待数据到达
                 tail = self.module_serial.read(data_size + 1)
+                received_at = time.perf_counter()
                 if len(tail) < data_size + 1:
+                    self.module_response_queue.put(('receive_stat', '包体短读', received_at))
                     continue  # 数据不完整，重新读取
 
                 data = tail[0:data_size]
@@ -4509,6 +5515,7 @@ class MainWindow(QMainWindow):
                     calc_checksum ^= b
 
                 if calc_checksum != checksum[0]:
+                    self.module_response_queue.put(('receive_stat', '校验失败', received_at))
                     self.module_response_queue.put(('error', b'Checksum error'))
                     continue
 
@@ -4524,13 +5531,15 @@ class MainWindow(QMainWindow):
                         msg_id = data[0]
                         result = data[1] if data_size >= 2 else 0xFF
                         payload = data[2:] if data_size > 2 else b''
-                        self.module_response_queue.put(('reply', msg_id, result, payload))
+                        self.module_response_queue.put(('reply', msg_id, result, payload,
+                                                        (received_at, time.perf_counter())))
 
                 elif msg_type_val == 0x01:  # Note消息
                     self.module_response_queue.put(('note', data))
 
                 elif msg_type_val == 0x02:  # 图片数据消息
-                    self.module_response_queue.put(('image_data', data_size, data))
+                    self.module_response_queue.put(('image_data', data_size, data,
+                                                    (received_at, time.perf_counter())))
 
                 else:
                     self.module_response_queue.put(('error', f'Unknown message type: 0x{msg_type_val:02X}'.encode()))
@@ -4546,12 +5555,26 @@ class MainWindow(QMainWindow):
             while not self.module_response_queue.empty():
                 response = self.module_response_queue.get_nowait()
 
-                if response[0] == 'error':
+                if response[0] == 'receive_stat':
+                    perf = getattr(self, 'download_perf', None)
+                    if perf and response[2] >= perf.started:
+                        perf.count(response[1])
+                    ota_perf = getattr(self, 'ota_perf', None)
+                    if ota_perf and response[2] >= ota_perf.started:
+                        ota_perf.count(response[1])
+                elif response[0] == 'error':
+                    if response[1].startswith(b'Receive error:') and getattr(self, 'download_perf', None):
+                        self.is_downloading = False
+                        self.end_download_performance('中止（串口接收异常）')
+                    if response[1].startswith(b'Receive error:') and getattr(self, 'ota_perf', None):
+                        self.finish_ota('中止（串口接收异常）')
                     error_msg = response[1].decode('utf-8', errors='ignore')
                     self.append_module_log(f'[错误] {error_msg}', error=True)
                 elif response[0] == 'reply':
                     # Reply消息: ('reply', msg_id, result, payload)
-                    _, msg_id, result, payload = response
+                    _, msg_id, result, payload = response[:4]
+                    if msg_id == 0x44 and len(response) > 4 and getattr(self, 'ota_perf', None):
+                        self.record_ota_ack_timing(response[4])
                     # 优化：下载期间减少打印
                     # if not self.is_downloading or msg_id not in [0x18, 0x51]:
                     #     print(f'[调试-Reply] msg_id=0x{msg_id:02X}, result=0x{result:02X}, payload长度={len(payload)}')
@@ -4563,10 +5586,8 @@ class MainWindow(QMainWindow):
                     #     print(f'[调试-Note] data长度={len(data)}, 前4字节={data[:4].hex().upper() if len(data) >= 4 else data.hex().upper()}')
                     self.module_response_signal.emit('note', ('note', 0, data))
                 elif response[0] == 'image_data':
-                    # 图片数据消息: ('image_data', data_size, img_data)
-                    # 优化：下载期间不打印每个包的接收信息
-                    _, data_size, img_data = response
-                    self.handle_image_data(data_size, img_data)
+                    _, data_size, img_data, timing = response
+                    self.handle_image_data(data_size, img_data, timing)
         except queue.Empty:
             pass
 
@@ -4600,6 +5621,18 @@ class MainWindow(QMainWindow):
                     self.pending_command = None
             except:
                 pass
+
+        if (getattr(self, 'download_perf', None) and result != 0x00
+                and msg_id in ('0x14', '0x15', '0x51')):
+            self.is_downloading = False
+            self.end_download_performance(f'中止（{msg_id} 返回失败）')
+
+        if msg_id == '0x51' and result != 0x00 and getattr(self, 'ota_perf', None):
+            self.finish_ota('中止（设置波特率失败）')
+        if msg_id in ('0x40', '0x43'):
+            expected_stage = 2 if msg_id == '0x40' else 3
+            if not self.ota_in_progress or self.ota_stage != expected_stage:
+                return
 
         # 计算时长
         elapsed_time = self.get_command_elapsed_time(msg_id)
@@ -4670,7 +5703,7 @@ class MainWindow(QMainWindow):
                 error_messages = {
                     0x01: '模组拒绝此命令',
                     0x04: 'Camera open fail',
-                    0x08: '无人脸录入',
+                    0x08: '无人脸录入/无该用户',
                     0x09: '超出最大注册用户数量',
                     0x0C: '活体检测失败',
                     0x0D: '超时',
@@ -4789,10 +5822,10 @@ class MainWindow(QMainWindow):
                                 self.append_module_log(f'[OTA] 串口波特率已切换到 {actual_baudrate}')
                                 # 进入下一阶段：发送0x40进入OTA状态
                                 self.ota_stage = 2
-                                QTimer.singleShot(100, self.enter_ota_mode)
+                                self.schedule_ota_step(100, 2, self.enter_ota_mode)
                             except Exception as e:
                                 self.append_module_log(f'[OTA] 切换波特率失败: {e}', error=True)
-                                self.ota_in_progress = False
+                                self.finish_ota('中止（切换波特率失败）')
                     elif self.ota_in_progress and self.ota_stage > 1:
                         # OTA升级过程中（stage > 1），忽略其他0x51响应
                         print(f'[调试-0x51] OTA升级过程中，忽略0x51响应（stage={self.ota_stage}）')
@@ -4805,6 +5838,8 @@ class MainWindow(QMainWindow):
                         print(f'[调试-0x51] 图片下载流程，开始切换串口波特率...')
                         try:
                             self.module_serial.baudrate = baudrate
+                            if getattr(self, 'download_perf', None):
+                                self.download_perf.mark('high_baud')
                             print(f'[调试-0x51] 串口波特率切换成功')
                             self.append_module_log(f'串口波特率已切换到 {baudrate}')
 
@@ -4814,11 +5849,23 @@ class MainWindow(QMainWindow):
                         except Exception as e:
                             print(f'[调试-0x51] 切换波特率异常: {e}')
                             self.append_module_log(f'[错误] 切换波特率失败: {e}', error=True)
+                            self.is_downloading = False
+                            self.end_download_performance('中止（切换波特率失败）')
                     elif baudrate == 115200 and self.module_serial:
                         # 恢复标准波特率
                         print(f'[调试-0x51] 恢复标准波特率')
-                        self.module_serial.baudrate = baudrate
+                        try:
+                            self.module_serial.baudrate = baudrate
+                        except Exception as e:
+                            self.end_download_performance('中止（恢复波特率失败）')
+                            self.append_module_log(f'[错误] 恢复波特率失败: {e}', error=True)
+                            return
                         self.append_module_log(f'串口波特率已恢复到 {baudrate}')
+                        perf = getattr(self, 'download_perf', None)
+                        if perf:
+                            perf.mark('restored')
+                            outcome = '完成' if 'preview' in perf.stages else '中止（传输未完成）'
+                            self.end_download_performance(outcome)
 
                         # 判断是否是待机恢复波特率
                         if getattr(self, 'is_standby_restoring', False):
@@ -4857,6 +5904,7 @@ class MainWindow(QMainWindow):
                     self.start_image_download()
                 else:
                     self.append_module_log(f'[错误] 图片大小数据长度不足 {elapsed_time}', error=True)
+                    self.end_download_performance('中止（JPEG大小回复不完整）')
             else:
                 self.append_module_log(f'[错误] 获取图片大小失败 {elapsed_time}', error=True)
 
@@ -4887,6 +5935,7 @@ class MainWindow(QMainWindow):
                     self.start_image_download()
                 else:
                     self.append_module_log(f'[错误] RAW图大小数据长度不足 {elapsed_time}', error=True)
+                    self.end_download_performance('中止（RAW大小回复不完整）')
             else:
                 self.append_module_log(f'[错误] 获取RAW图大小失败 {elapsed_time}', error=True)
 
@@ -5214,10 +6263,10 @@ class MainWindow(QMainWindow):
                 # 进入下一阶段：发送OTA header
                 if self.ota_in_progress and self.ota_stage == 2:
                     self.ota_stage = 3
-                    QTimer.singleShot(100, self.send_ota_header)
+                    self.schedule_ota_step(100, 3, self.send_ota_header)
             else:
                 self.append_module_log(f'[OTA] 进入OTA状态失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
-                self.ota_in_progress = False
+                self.finish_ota('中止（进入OTA失败）')
 
         elif msg_id == '0x43':  # OTA header
             print(f'[OTA调试] 收到0x43响应: result=0x{result:02X}, payload长度={len(payload)}')
@@ -5229,15 +6278,19 @@ class MainWindow(QMainWindow):
                 if self.ota_in_progress and self.ota_stage == 3:
                     self.ota_stage = 4
                     self.ota_current_packet = 0
-                    QTimer.singleShot(100, self.send_ota_packet)
+                    self.set_download_polling(False)
+                    self.schedule_ota_step(100, 4, self.send_ota_packet)
             else:
                 self.append_module_log(f'[OTA] OTA header发送失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
-                self.ota_in_progress = False
+                self.finish_ota('中止（header失败）')
 
         elif msg_id == '0x44':  # OTA固件包传输
-            # 只在每10包或出错时打印调试信息
-            if self.ota_current_packet % 10 == 0 or result != 0x00:
-                print(f'[OTA调试] 收到0x44响应: 包序号={self.ota_current_packet}, result=0x{result:02X}')
+            if not (self.ota_in_progress and self.ota_stage == 4 and self.ota_waiting_ack):
+                return
+            self.ota_waiting_ack = False
+            perf = getattr(self, 'ota_perf', None)
+            if perf:
+                perf.handled_at = time.perf_counter()
 
             if result == 0x00:
                 # 停止超时重传定时器
@@ -5250,20 +6303,32 @@ class MainWindow(QMainWindow):
 
                 # 继续发送下一包
                 if self.ota_in_progress and self.ota_stage == 4:
+                    if perf:
+                        perf.packets += 1
+                        perf.bytes_received += min(self.ota_packet_size,
+                            len(self.ota_file_data) - self.ota_current_packet * self.ota_packet_size)
+                        perf.request_retried = False
                     self.ota_current_packet += 1
                     progress = (self.ota_current_packet / self.ota_total_packets) * 100
 
-                    # 每10包或最后一包显示进度
-                    if self.ota_current_packet % 10 == 0 or self.ota_current_packet >= self.ota_total_packets:
+                    # 进度限频，最后一包必输出
+                    now = time.perf_counter()
+                    if (self.ota_current_packet >= self.ota_total_packets
+                            or (perf and now - perf.last_progress >= 1.0)):
+                        if perf:
+                            perf.last_progress = now
                         self.append_module_log(f'[OTA] 传输进度: {self.ota_current_packet}/{self.ota_total_packets} ({progress:.1f}%)')
 
                     if self.ota_current_packet < self.ota_total_packets:
                         # 继续发送下一包
-                        QTimer.singleShot(10, self.send_ota_packet)
+                        self.schedule_ota_step(10, 4, self.send_ota_packet)
                     else:
                         # 所有包发送完成，等待烧录
                         self.append_module_log('[OTA] 所有固件包发送完成，等待模组烧录...', success=True)
                         self.ota_stage = 5
+                        self.set_download_polling(False)
+                        if perf:
+                            perf.mark('received')
             else:
                 self.append_module_log(f'[OTA] 固件包传输失败，包序号: {self.ota_current_packet}, 结果码: 0x{result:02X}', error=True)
                 # 停止超时重传定时器
@@ -5273,11 +6338,14 @@ class MainWindow(QMainWindow):
                 # 传输失败，尝试重传
                 if self.ota_retry_count < 3:
                     self.ota_retry_count += 1
+                    if perf:
+                        perf.count('错误ACK重传')
+                        perf.request_retried = True
                     self.append_module_log(f'[OTA] 第{self.ota_retry_count}次重传包序号: {self.ota_current_packet}')
-                    QTimer.singleShot(100, self.send_ota_packet)
+                    self.schedule_ota_step(100, 4, self.send_ota_packet)
                 else:
                     self.append_module_log(f'[OTA] 包序号{self.ota_current_packet}重传3次后仍失败，终止OTA升级', error=True)
-                    self.ota_in_progress = False
+                    self.finish_ota('中止（错误ACK重试耗尽）')
 
     def handle_note_message(self, data):
         """处理Note消息"""
@@ -5297,17 +6365,21 @@ class MainWindow(QMainWindow):
 
             # OTA过程结束通知（data[0]=0x03, data[1]=0x00表示OTA结束）
             if nid == 0x03:
+                if not self.ota_in_progress or self.ota_stage != 5:
+                    return
                 status = data[1] if len(data) >= 2 else 0xFF
                 print(f'[OTA调试] 收到OTA结束Note消息: nid=0x{nid:02X}, status=0x{status:02X}')
                 hex_data = ' '.join([f'{b:02X}' for b in data])
                 print(f'[OTA调试] Note完整数据: {hex_data}')
                 if status == 0x00:
-                    QTimer.singleShot(300, lambda: self.append_module_log('[OTA] 烧录完成！', success=True))
+                    self.append_module_log('[OTA] 烧录完成，等待模组重启！', success=True)
+                    if getattr(self, 'ota_perf', None):
+                        self.ota_perf.mark('burned')
                     # 等待模组重启并发送ready消息
                     self.ota_stage = 6
                 else:
                     self.append_module_log(f'[OTA] 烧录失败，状态码: 0x{status:02X}', error=True)
-                    self.ota_in_progress = False
+                    self.finish_ota('中止（模组烧录失败）')
                 return
 
             # Ready消息（data[0]=0x00, data[1]=0x00表示模组ready）
@@ -5319,10 +6391,14 @@ class MainWindow(QMainWindow):
                 if status == 0x00:
                     if self.ota_in_progress and self.ota_stage == 6:
                         self.append_module_log('[OTA] 模组重启成功，OTA升级完成！', success=True)
-                        self.ota_in_progress = False
-                        self.ota_stage = 0
+                        if getattr(self, 'ota_perf', None):
+                            self.ota_perf.mark('ready')
+                        self.finish_ota('升级完成')
                     else:
                         self.append_module_log('[模组] Ready消息收到', success=True)
+                elif self.ota_in_progress and self.ota_stage == 6:
+                    self.append_module_log(f'[OTA] 模组重启失败，状态码: 0x{status:02X}', error=True)
+                    self.finish_ota('中止（模组重启失败）')
                 return
 
             # 判断是人脸还是手掌
@@ -5482,10 +6558,17 @@ class MainWindow(QMainWindow):
             data: 数据部分（字节串）
         """
         if not self.module_connected or not self.module_serial:
+            if getattr(self, 'download_perf', None):
+                self.is_downloading = False
+                self.end_download_performance('中止（模组未连接）')
+            if getattr(self, 'ota_perf', None):
+                self.finish_ota('中止（模组未连接）')
             QMessageBox.warning(self, '提示', '模组串口未连接')
             return False
 
         try:
+            ota_perf = getattr(self, 'ota_perf', None) if msg_id == 0x44 else None
+            build_started = time.perf_counter() if ota_perf else None
             # 构建消息
             sync = b'\xEF\xAA'
             msg_id_byte = bytes([msg_id])
@@ -5506,9 +6589,19 @@ class MainWindow(QMainWindow):
             #     hex_msg = ' '.join([f'{b:02X}' for b in message])
             #     print(f'[发送指令] MID=0x{msg_id:02X}, 完整消息: {hex_msg}')
 
-            # 发送
+            # 保留 flush，先测量它是否造成逐包等待
+            perf = getattr(self, 'download_perf', None) if msg_id == 0x18 else None
+            perf = ota_perf or perf
+            write_started = time.perf_counter()
+            if ota_perf:
+                ota_perf.add('协议封装/校验', write_started - build_started)
             self.module_serial.write(message)
+            written_at = time.perf_counter()
             self.module_serial.flush()
+            flushed_at = time.perf_counter()
+            if perf:
+                perf.add('串口write', written_at - write_started)
+                perf.add('串口flush', flushed_at - written_at)
 
             # 记录发送时间
             self.module_command_start_time[msg_id] = time.time()
@@ -5539,6 +6632,11 @@ class MainWindow(QMainWindow):
             return True
 
         except Exception as e:
+            if getattr(self, 'download_perf', None):
+                self.is_downloading = False
+                self.end_download_performance('中止（发送失败）')
+            if getattr(self, 'ota_perf', None):
+                self.finish_ota('中止（发送失败）')
             QMessageBox.critical(self, '发送失败', f'发送指令失败:\n{e}')
             return False
 
@@ -5552,6 +6650,10 @@ class MainWindow(QMainWindow):
         # 最多重试3次
         if retry_count < 3:
             retry_count += 1
+            if getattr(self, 'download_perf', None):
+                self.download_perf.count(f'命令0x{msg_id:02X}超时重传')
+            if getattr(self, 'ota_perf', None):
+                self.ota_perf.count(f'命令0x{msg_id:02X}超时重传')
             self.pending_command = (msg_id, data, retry_count)
 
             msg_name_map = {
@@ -5578,6 +6680,13 @@ class MainWindow(QMainWindow):
             self.append_module_log(f'[错误] {msg_name}指令重试3次后仍无响应，请检查模组连接', error=True)
             self.pending_command = None
 
+            if getattr(self, 'download_perf', None):
+                self.is_downloading = False
+                self.end_download_performance('中止（命令超时重试耗尽）')
+
+            if getattr(self, 'ota_perf', None):
+                self.finish_ota('中止（命令超时重试耗尽）')
+
             # 清理下载状态
             if msg_id in [0x14, 0x15]:
                 self.is_downloading = False
@@ -5594,9 +6703,9 @@ class MainWindow(QMainWindow):
     def get_all_user_ids(self):
         """获取所有用户ID"""
         # 根据模式选择发送不同的指令
-        if self.palm_mode_radio.isChecked():
+        if self.operation_mode_actions['palm'].isChecked():
             # 手掌模式：根据项目模式选择命令
-            if self.kds_mode_radio.isChecked():
+            if self.project_mode_actions['KDS'].isChecked():
                 cmd = 0x84  # KDS模式
                 mode_name = 'KDS手掌模式'
             else:
@@ -5695,7 +6804,7 @@ class MainWindow(QMainWindow):
             self.repeat_reply_received = False  # 重置Reply接收标志
 
         # 根据项目模式选择命令ID
-        if self.kds_mode_radio.isChecked():
+        if self.project_mode_actions['KDS'].isChecked():
             cmd = 0x80  # KDS模式
             mode_name = 'KDS手掌注册'
         else:
@@ -5736,7 +6845,7 @@ class MainWindow(QMainWindow):
             self.repeat_reply_received = False  # 重置Reply接收标志
 
         # 根据项目模式选择命令ID
-        if self.kds_mode_radio.isChecked():
+        if self.project_mode_actions['KDS'].isChecked():
             cmd = 0x81  # KDS模式
             mode_name = 'KDS手掌识别'
         else:
@@ -5773,9 +6882,9 @@ class MainWindow(QMainWindow):
             return
 
         # 根据模式选择发送不同的指令
-        if self.palm_mode_radio.isChecked():
+        if self.operation_mode_actions['palm'].isChecked():
             # 手掌模式：根据项目模式选择命令
-            if self.kds_mode_radio.isChecked():
+            if self.project_mode_actions['KDS'].isChecked():
                 cmd = 0x83  # KDS模式
                 mode_name = 'KDS手掌模式'
             else:
@@ -5808,9 +6917,9 @@ class MainWindow(QMainWindow):
             return
 
         # 根据模式选择发送不同的指令
-        if self.palm_mode_radio.isChecked():
+        if self.operation_mode_actions['palm'].isChecked():
             # 手掌模式：根据项目模式选择命令
-            if self.kds_mode_radio.isChecked():
+            if self.project_mode_actions['KDS'].isChecked():
                 cmd = 0x82  # KDS模式
                 mode_name = 'KDS手掌模式'
             else:
@@ -5850,8 +6959,7 @@ class MainWindow(QMainWindow):
         # 停止OTA升级流程
         if self.ota_in_progress:
             self.append_module_log('[待机] 停止OTA升级流程...')
-            self.ota_in_progress = False
-            self.ota_stage = 0
+            self.finish_ota('中止（进入待机）')
             self.ota_current_packet = 0
             self.ota_retry_count = 0
             if self.ota_retry_timer:
@@ -5867,6 +6975,7 @@ class MainWindow(QMainWindow):
                 # 发送0x51指令设置波特率为115200
                 self.send_module_command(0x51, b'\x01')  # 0x01 = 115200
                 # 立即停止所有下载操作
+                self.end_download_performance('中止（进入待机）')
                 self.is_downloading = False
                 if self.retry_timer:
                     self.retry_timer.stop()
@@ -5938,10 +7047,36 @@ class MainWindow(QMainWindow):
             self.send_module_command(0x14)
             print(f'[调试-0x51] 已发送0x14指令')
 
+    def set_download_polling(self, active):
+        timer = getattr(self, 'module_response_timer', None)
+        if timer is not None:
+            ota_active = getattr(self, 'ota_in_progress', False) and self.ota_stage == 4
+            timer.setInterval(5 if active or ota_active else 100)
+
+    def begin_download_performance(self, image_type):
+        if getattr(self, 'download_perf', None):
+            self.end_download_performance('中止（开始新的下载）')
+        self.download_perf = DownloadPerformance(image_type)
+
+    def end_download_performance(self, outcome):
+        self.set_download_polling(False)
+        if self.retry_timer:
+            self.retry_timer.stop()
+        perf = getattr(self, 'download_perf', None)
+        self.download_perf = None
+        if perf:
+            self.is_downloading = False
+            if self.command_timeout_timer:
+                self.command_timeout_timer.stop()
+            self.pending_command = None
+            if outcome.startswith('中止'):
+                self.append_module_log(f'[下载] {outcome}', error=True)
+
     def download_image(self):
         """下载JPEG图片（完整流程）"""
-        if self.is_downloading:
-            self.append_module_log('[警告] 正在下载中，请勿重复操作', error=True)
+        if (self.is_downloading or getattr(self, 'download_perf', None)
+                or getattr(self, 'ota_in_progress', False)):
+            self.append_module_log('[警告] 图片下载或OTA正在进行中，请勿重复操作', error=True)
             return
 
         # 重置所有下载状态，准备新的下载
@@ -5956,6 +7091,7 @@ class MainWindow(QMainWindow):
             self.retry_timer.stop()
             self.retry_timer = None
 
+        self.begin_download_performance('jpeg')
         self.append_module_log('[下载JPEG] 开始下载流程...')
 
         # 步骤1: 设置高速波特率 1500000
@@ -5964,8 +7100,9 @@ class MainWindow(QMainWindow):
 
     def download_raw_image(self):
         """下载RAW图片（完整流程）"""
-        if self.is_downloading:
-            self.append_module_log('[警告] 正在下载中，请勿重复操作', error=True)
+        if (self.is_downloading or getattr(self, 'download_perf', None)
+                or getattr(self, 'ota_in_progress', False)):
+            self.append_module_log('[警告] 图片下载或OTA正在进行中，请勿重复操作', error=True)
             return
 
         # 重置所有下载状态，准备新的下载
@@ -5980,6 +7117,7 @@ class MainWindow(QMainWindow):
             self.retry_timer.stop()
             self.retry_timer = None
 
+        self.begin_download_performance('raw')
         self.append_module_log('[下载RAW] 开始下载流程...')
 
         # 步骤1: 设置高速波特率 1500000
@@ -5994,13 +7132,17 @@ class MainWindow(QMainWindow):
         self.download_total_size = self.image1_size + self.image2_size
         self.is_downloading = True
 
-        # 性能分析：记录开始时间
-        self.download_start_time = time.time()
-        self.last_packet_time = time.time()
-        self.packet_count = 0
+        if not getattr(self, 'download_perf', None):
+            self.begin_download_performance(self.download_type)
+        self.download_perf.mark('transfer')
+        self.download_perf.baudrate = getattr(self.module_serial, 'baudrate', 1500000)
+        self.set_download_polling(True)
+        if self.download_total_size <= 0:
+            self.is_downloading = False
+            self.end_download_performance('中止（图片大小为零）')
+            return
 
         self.append_module_log(f'开始下载图片数据，总大小 {self.download_total_size} 字节')
-        # print(f'[性能] 开始下载，时间戳: {self.download_start_time}')
 
         # 发送第一个上传请求
         self.send_image_upload_request(0, min(4000, self.download_total_size))
@@ -6017,9 +7159,16 @@ class MainWindow(QMainWindow):
 
         # 记录最后一次的上传指令，用于重传
         self.last_upload_command = (offset, size)
-        self.last_upload_time = datetime.now()  # 记录发送时间
+        perf = getattr(self, 'download_perf', None)
+        if perf:
+            now = time.perf_counter()
+            if perf.handled_at is not None:
+                perf.add('GUI处理至下次请求', now - perf.handled_at)
+                perf.handled_at = None
+            perf.request_started = now
 
-        self.send_module_command(0x18, data)
+        if not self.send_module_command(0x18, data):
+            return
 
         # 停止之前的重传定时器
         if self.retry_timer:
@@ -6035,6 +7184,9 @@ class MainWindow(QMainWindow):
         """上传请求超时，触发重传"""
         if self.last_upload_command and self.is_downloading:
             offset, size = self.last_upload_command
+            if getattr(self, 'download_perf', None):
+                self.download_perf.count('上传超时重传')
+                self.download_perf.request_retried = True
             self.append_module_log(f'[超时重传] 未收到响应，重新发送请求，偏移量={offset}, 大小={size}', error=True)
             self.send_image_upload_request(offset, size)
 
@@ -6042,65 +7194,56 @@ class MainWindow(QMainWindow):
         """重传最后一次的上传指令"""
         if self.last_upload_command and self.is_downloading:
             offset, size = self.last_upload_command
+            if getattr(self, 'download_perf', None):
+                self.download_perf.count('设备错误重传')
+                self.download_perf.request_retried = True
             self.append_module_log(f'[重传] 重新发送上传请求，偏移量={offset}, 大小={size}')
             self.send_image_upload_request(offset, size)
         else:
             print('[调试-重传] 没有可重传的指令或未在下载中')
 
-    def handle_image_data(self, data_size, img_data):
-        """处理接收到的图片数据"""
+    def handle_image_data(self, data_size, img_data, timing=None):
+        """处理图片包；收包线程只传递时间戳，统计在主线程聚合。"""
         if not self.is_downloading:
             return
+        now = time.perf_counter()
+        perf = getattr(self, 'download_perf', None)
+        if perf:
+            perf.handled_at = now
+            perf.packets += 1
+            perf.bytes_received += data_size
+            if timing:
+                received, queued = timing
+                perf.add('收包后校验/入队准备', queued - received)
+                perf.add('队列等待GUI', now - queued)
+                if perf.request_started is not None and received >= perf.request_started:
+                    name = '重传请求至完整包' if perf.request_retried else '请求至完整包'
+                    perf.add(name, received - perf.request_started)
+            perf.request_retried = False
 
-        # 重置提前请求标志，允许下次提前发送
-        self.next_request_sent = False
-
-        # 性能分析：记录包接收时间
-        current_time = time.time()
-        if hasattr(self, 'last_packet_time'):
-            packet_interval = (current_time - self.last_packet_time) * 1000  # 转换为毫秒
-            self.packet_count += 1
-
-            # 每10包打印一次性能统计
-            # if self.packet_count % 10 == 0:
-            #     print(f'[性能] 包#{self.packet_count}, 间隔: {packet_interval:.1f}ms, 已下载: {self.download_offset}/{self.download_total_size}')
-
-        self.last_packet_time = current_time
-
-        # 停止重传定时器（收到数据说明传输成功）
         if self.retry_timer:
             self.retry_timer.stop()
-
-        # 将接收到的数据追加到缓冲区
-        t1 = time.time()
+        before_append = time.perf_counter()
         self.download_buffer.extend(img_data)
         self.download_offset += data_size
-        t2 = time.time()
+        if perf:
+            perf.add('缓冲拼接', time.perf_counter() - before_append)
 
-        # 每50包打印一次数据拼接耗时
-        # if self.packet_count % 50 == 0:
-        #     print(f'[性能] 数据拼接耗时: {(t2-t1)*1000:.2f}ms')
-
-        # 优化：只在每10包或下载完成时更新进度显示（减少GUI刷新）
-        progress = (self.download_offset / self.download_total_size) * 100
-        packet_count = self.download_offset // 4000
-        if packet_count % 10 == 0 or self.download_offset >= self.download_total_size:
+        complete = self.download_offset >= self.download_total_size
+        if complete or (perf and now - perf.last_progress >= 1.0):
+            progress = self.download_offset / self.download_total_size * 100
             self.append_module_log(f'[下载进度] {self.download_offset}/{self.download_total_size} ({progress:.1f}%)')
+            if perf:
+                perf.last_progress = now
 
-        # 检查是否下载完成
-        if self.download_offset >= self.download_total_size:
-            # 性能分析：计算总耗时
-            total_time = time.time() - self.download_start_time
-            speed_kbps = (self.download_total_size / 1024) / total_time
-            # print(f'[性能] 下载完成！总耗时: {total_time:.2f}秒, 平均速度: {speed_kbps:.2f} KB/s, 总包数: {self.packet_count}')
-            # print(f'[性能] 平均包间隔: {(total_time / self.packet_count * 1000):.1f}ms')
-
+        if complete:
+            if perf:
+                perf.mark('received')
+            self.set_download_polling(False)
             self.finish_image_download()
-        # 如果提前请求没有发送（可能因为时序问题），则在这里发送
-        elif not self.next_request_sent:
+        else:
             remaining = self.download_total_size - self.download_offset
-            next_size = min(4000, remaining)
-            self.send_image_upload_request(self.download_offset, next_size)
+            self.send_image_upload_request(self.download_offset, min(4000, remaining))
 
     def finish_image_download(self):
         """完成图片下载，分离并保存两张图片，并显示到预览区"""
@@ -6110,6 +7253,9 @@ class MainWindow(QMainWindow):
             # 分离两张图片
             image1_data = bytes(self.download_buffer[:self.image1_size])
             image2_data = bytes(self.download_buffer[self.image1_size:self.image1_size + self.image2_size])
+            perf = getattr(self, 'download_perf', None)
+            if perf:
+                perf.mark('split')
 
             # 生成时间戳
             timestamp_dt = datetime.now()  # datetime 对象
@@ -6130,6 +7276,8 @@ class MainWindow(QMainWindow):
                     f.write(image1_data)
                 with open(temp_image2_path, 'wb') as f:
                     f.write(image2_data)
+                if perf:
+                    perf.mark('saved')
 
                 self.append_module_log(f'[下载完成] RAW图已下载（灰度图 + NV12）', success=True)
 
@@ -6177,6 +7325,8 @@ class MainWindow(QMainWindow):
                     f.write(image1_data)
                 with open(temp_image2_path, 'wb') as f:
                     f.write(image2_data)
+                if perf:
+                    perf.mark('saved')
 
                 self.append_module_log(f'[下载完成] 图片已加载到预览区', success=True)
 
@@ -6210,6 +7360,9 @@ class MainWindow(QMainWindow):
                 # 更新历史记录下拉框
                 self.update_history_combo()
 
+            if perf:
+                perf.mark('preview')
+            self.set_download_polling(False)
             # 步骤4: 恢复标准波特率 115200
             self.append_module_log('恢复波特率为 115200')
 
@@ -6219,10 +7372,13 @@ class MainWindow(QMainWindow):
             # 注意：不要重置download_offset和download_total_size，用于判断是恢复波特率
 
             self.send_module_command(0x51, b'\x01')  # 0x01 = 115200
+            if getattr(self, 'download_perf', None):
+                self.download_perf.mark('restore_sent')
 
         except Exception as e:
             self.append_module_log(f'[错误] 处理图片失败: {e}', error=True)
             self.is_downloading = False
+            self.end_download_performance('中止（图片处理失败）')
 
     def append_module_log(self, text, success=False, error=False):
         """添加模组日志"""
@@ -6407,10 +7563,56 @@ class MainWindow(QMainWindow):
     # OTA升级相关方法
     # ==============================
 
+    def schedule_ota_step(self, delay, stage, callback):
+        """使用可取消的延迟任务，避免中止后仍发送旧固件。"""
+        if getattr(self, 'ota_step_timer', None):
+            self.ota_step_timer.stop()
+            self.ota_step_timer.deleteLater()
+        self.ota_step_timer = QTimer(self)
+        self.ota_step_timer.setSingleShot(True)
+        self.ota_step_timer.setTimerType(Qt.PreciseTimer)
+        self.ota_step_timer.timeout.connect(
+            lambda: callback() if self.ota_in_progress and self.ota_stage == stage else None
+        )
+        self.ota_step_timer.start(delay)
+
+    def finish_ota(self, outcome):
+        self.ota_in_progress = False
+        self.ota_stage = 0
+        self.ota_waiting_ack = False
+        for name in ('ota_step_timer', 'ota_retry_timer'):
+            timer = getattr(self, name, None)
+            if timer:
+                timer.stop()
+                timer.deleteLater()
+                setattr(self, name, None)
+        if self.pending_command and self.pending_command[0] in (0x51, 0x40, 0x43, 0x44):
+            if self.command_timeout_timer:
+                self.command_timeout_timer.stop()
+            self.pending_command = None
+        self.set_download_polling(self.is_downloading)
+        perf = getattr(self, 'ota_perf', None)
+        self.ota_perf = None
+        if perf and outcome.startswith('中止'):
+            self.append_module_log(f'[OTA] {outcome}', error=True)
+
+    def record_ota_ack_timing(self, timing):
+        perf = getattr(self, 'ota_perf', None)
+        if not (perf and self.ota_in_progress and self.ota_stage == 4
+                and self.ota_waiting_ack):
+            return
+        now = time.perf_counter()
+        received, queued = timing
+        if perf.request_started is not None and received >= perf.request_started:
+            label = '重传发送至完整ACK' if perf.request_retried else '发送至完整ACK'
+            perf.add(label, received - perf.request_started)
+            perf.add('ACK校验/入队准备', queued - received)
+            perf.add('ACK等待GUI', now - queued)
+
     def start_ota_upgrade(self):
         """启动OTA升级流程"""
-        if self.ota_in_progress:
-            QMessageBox.warning(self, '提示', 'OTA升级正在进行中，请勿重复操作')
+        if self.ota_in_progress or self.is_downloading or getattr(self, 'download_perf', None):
+            QMessageBox.warning(self, '提示', 'OTA升级或图片下载正在进行中，请勿重复操作')
             return
 
         # 创建OTA配置对话框
@@ -6497,6 +7699,10 @@ class MainWindow(QMainWindow):
 
     def execute_ota_upgrade(self):
         """执行OTA升级"""
+        if self.ota_in_progress or self.is_downloading or getattr(self, 'download_perf', None):
+            self.append_module_log('[OTA] 图片下载或OTA正在进行中，无法开始', error=True)
+            return
+        self.ota_perf = OtaPerformance()
         try:
             # 读取固件包
             self.ota_file_path = self.ota_file_input.text()
@@ -6504,6 +7710,9 @@ class MainWindow(QMainWindow):
                 self.ota_file_data = f.read()
 
             file_size = len(self.ota_file_data)
+            self.ota_perf.mark('loaded')
+            if not file_size:
+                raise ValueError('固件包为空')
             self.append_module_log(f'[OTA] 固件包加载成功，大小: {file_size} 字节')
 
             # 获取配置
@@ -6530,12 +7739,16 @@ class MainWindow(QMainWindow):
             self.append_module_log(f'[OTA] 步骤1: 设置波特率为 {baudrate_value}')
             # 保存目标波特率，供0x51响应处理使用
             self.ota_target_baudrate = baudrate_value
+            self.ota_perf.baudrate = baudrate_value
+            self.ota_retry_count = 0
+            self.ota_waiting_ack = False
             print(f'[OTA调试] 发送0x51指令，波特率代码: 0x{baudrate_code:02X}, 目标波特率: {baudrate_value}')
-            self.send_module_command(0x51, bytes([baudrate_code]))
+            if not self.send_module_command(0x51, bytes([baudrate_code])):
+                self.finish_ota('中止（波特率指令发送失败）')
 
         except Exception as e:
+            self.finish_ota('中止（OTA启动失败）')
             QMessageBox.critical(self, '错误', f'OTA升级失败:\n{e}')
-            self.ota_in_progress = False
 
     def switch_baudrate_for_ota(self, baudrate):
         """切换串口波特率（用于OTA）"""
@@ -6546,20 +7759,25 @@ class MainWindow(QMainWindow):
 
                 # 步骤2: 发送0x40进入OTA状态
                 self.ota_stage = 2
-                QTimer.singleShot(100, self.enter_ota_mode)
+                self.schedule_ota_step(100, 2, self.enter_ota_mode)
         except Exception as e:
             self.append_module_log(f'[OTA] 切换波特率失败: {e}', error=True)
-            self.ota_in_progress = False
+            self.finish_ota('中止（切换波特率失败）')
 
     def enter_ota_mode(self):
         """进入OTA模式"""
+        if not self.ota_in_progress or self.ota_stage != 2:
+            return
         self.append_module_log('[OTA] 步骤2: 进入OTA状态')
         # 发送0x40指令进入OTA状态
         print(f'[OTA调试] 发送0x40指令: EF AA 40 00 00 40')
-        self.send_module_command(0x40)
+        if not self.send_module_command(0x40):
+            self.finish_ota('中止（进入OTA指令发送失败）')
 
     def send_ota_header(self):
         """发送OTA header"""
+        if not self.ota_in_progress or self.ota_stage != 3:
+            return
         try:
             import hashlib
 
@@ -6605,17 +7823,27 @@ class MainWindow(QMainWindow):
             print(f'[OTA调试] Header数据长度: {len(data)}字节')
 
             # 发送0x43指令
-            self.send_module_command(0x43, data)
+            if not self.send_module_command(0x43, data):
+                self.finish_ota('中止（header发送失败）')
 
         except Exception as e:
             self.append_module_log(f'[OTA] 发送header失败: {e}', error=True)
-            self.ota_in_progress = False
+            self.finish_ota('中止（header发送失败）')
 
     def send_ota_packet(self):
         """发送OTA固件包"""
         try:
-            if not self.ota_in_progress or self.ota_current_packet >= self.ota_total_packets:
+            if (not self.ota_in_progress or self.ota_stage != 4
+                    or self.ota_current_packet >= self.ota_total_packets or self.ota_waiting_ack):
                 return
+            perf = getattr(self, 'ota_perf', None)
+            build_started = time.perf_counter()
+            if perf:
+                if 'transfer' not in perf.stages:
+                    perf.mark('transfer')
+                if perf.handled_at is not None:
+                    perf.add('ACK处理至下一包（含间隔）', build_started - perf.handled_at)
+                    perf.handled_at = None
 
             # 计算当前包的偏移和大小
             offset = self.ota_current_packet * self.ota_packet_size
@@ -6633,8 +7861,14 @@ class MainWindow(QMainWindow):
             # 包内容
             data += packet_data
 
-            # 发送0x44指令
-            self.send_module_command(0x44, data)
+            if perf:
+                perf.add('固件分包构造', time.perf_counter() - build_started)
+                perf.request_started = time.perf_counter()
+            self.ota_waiting_ack = True
+            # 发送失败后不启动本包超时重传
+            if not self.send_module_command(0x44, data):
+                self.finish_ota('中止（固件包发送失败）')
+                return
 
             # 停止之前的超时定时器
             if self.ota_retry_timer:
@@ -6648,21 +7882,24 @@ class MainWindow(QMainWindow):
 
         except Exception as e:
             self.append_module_log(f'[OTA] 发送固件包失败: {e}', error=True)
-            self.ota_in_progress = False
+            self.finish_ota('中止（固件包发送异常）')
 
     def on_ota_packet_timeout(self):
         """OTA固件包传输超时处理"""
         if not self.ota_in_progress or self.ota_stage != 4:
             return
 
+        self.ota_waiting_ack = False
         if self.ota_retry_count < 3:
             self.ota_retry_count += 1
+            if getattr(self, 'ota_perf', None):
+                self.ota_perf.count('ACK超时重传')
+                self.ota_perf.request_retried = True
             self.append_module_log(f'[OTA] 包序号{self.ota_current_packet}超时，第{self.ota_retry_count}次重传...', error=True)
             self.send_ota_packet()
         else:
             self.append_module_log(f'[OTA] 包序号{self.ota_current_packet}重传3次后仍超时，终止OTA升级', error=True)
-            self.ota_in_progress = False
-            self.ota_stage = 0
+            self.finish_ota('中止（ACK超时重试耗尽）')
 
     def closeEvent(self, event):
         """关闭事件"""
@@ -6675,6 +7912,11 @@ class MainWindow(QMainWindow):
             self.observer.stop()
             self.observer.join()
 
+        if self.log_marker_window:
+            self.log_marker_window.setParent(None)
+            self.log_marker_window.deleteLater()
+            self.log_marker_window = None
+
         event.accept()
 
 
@@ -6684,6 +7926,14 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setApplicationName('capLG')
+    app.setApplicationVersion('1.0.0.7')
+    icon_name = 'ChatGPT Image 2026年9月16日 00_28_09.png'
+    if getattr(sys, 'frozen', False):
+        icon_path = os.path.join(sys._MEIPASS, 'resources', icon_name)
+    else:
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), icon_name)
+    app.setWindowIcon(QIcon(icon_path))
 
     # 设置应用样式
     app.setStyle('Fusion')
