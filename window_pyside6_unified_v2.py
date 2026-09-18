@@ -27,7 +27,7 @@ else:
     winreg = None
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy,
     QLabel, QPushButton, QTextEdit, QComboBox, QLineEdit, QCheckBox,
     QRadioButton, QButtonGroup, QTabWidget, QMessageBox, QFileDialog,
     QDialog, QGroupBox, QFrame, QSplitter, QScrollArea, QSpinBox, QInputDialog,
@@ -132,7 +132,12 @@ class LogMarker:
 
     @property
     def summary(self):
-        return self.line_text[:10]
+        match = re.search(r'[A-Za-z]', self.line_text)
+        if match:
+            return self.line_text[match.start():match.start() + 20]
+        # 纯中文等没有英文字母的日志，退回到去除开头时间戳后的内容。
+        content = re.sub(r'^\[[^\]]*\]\s*', '', self.line_text, count=1)
+        return content[:20]
 
     @property
     def line_number(self):
@@ -1525,21 +1530,70 @@ class ImageData:
 # 串口日志线程
 # ==============================
 
-def serial_reader(port, baudrate, error_queue, connected_event=None, log_queue=None, send_queue=None):
+class SerialReaderControl:
+    """协调日志串口线程停止、句柄唤醒和关闭确认。"""
+
+    def __init__(self):
+        self.stop_event = threading.Event()
+        self.closed_event = threading.Event()
+        self._lock = threading.Lock()
+        self._serial = None
+        self.close_error = None
+
+    def set_serial(self, serial_instance):
+        with self._lock:
+            self._serial = serial_instance
+
+    def clear_serial(self, serial_instance=None):
+        with self._lock:
+            if serial_instance is None or self._serial is serial_instance:
+                self._serial = None
+
+    def request_stop(self):
+        self.stop_event.set()
+        with self._lock:
+            serial_instance = self._serial
+        if serial_instance is not None:
+            cancel_read = getattr(serial_instance, 'cancel_read', None)
+            if callable(cancel_read):
+                try:
+                    cancel_read()
+                except (OSError, serial.SerialException):
+                    pass
+
+    def is_active(self):
+        with self._lock:
+            has_serial = self._serial is not None
+        return (self.close_error is not None
+                or (not self.closed_event.is_set()
+                    and (has_serial or not self.stop_event.is_set())))
+
+
+def serial_reader(port, baudrate, error_queue, connected_event=None, log_queue=None,
+                  send_queue=None, control=None):
     """串口读取线程函数"""
+    has_explicit_control = control is not None
+    control = control or SerialReaderControl()
     ser = None
     try:
+        if control.stop_event.is_set():
+            return
         available_ports = [p.device for p in serial.tools.list_ports.comports()]
         if port not in available_ports:
             raise serial.SerialException(f'串口 {port} 不存在或未连接')
 
         ser = serial.Serial(port=port, baudrate=baudrate, timeout=1, write_timeout=0.5)
+        control.set_serial(ser)
+        if control.stop_event.is_set():
+            return
         print('串口打开成功:', port, baudrate)
 
         if connected_event is not None:
             connected_event.set()
 
-        while connected_event.is_set():  # 检查连接状态
+        while (not control.stop_event.is_set()
+               and (has_explicit_control or connected_event is None
+                    or connected_event.is_set())):
             # 检查发送队列
             if send_queue is not None:
                 try:
@@ -1570,18 +1624,22 @@ def serial_reader(port, baudrate, error_queue, connected_event=None, log_queue=N
                 time.sleep(0.01)
 
     except Exception as e:
-        print('串口异常:', e)
-        error_queue.put(f'串口 {port} 已断开或无法访问：\n{e}')
+        if not control.stop_event.is_set():
+            print('串口异常:', e)
+            error_queue.put(f'串口 {port} 已断开或无法访问：\n{e}')
     finally:
-        if connected_event is not None:
-            connected_event.clear()
-        # 确保串口被关闭
-        if ser is not None and ser.is_open:
+        # 确保工作线程退出前已释放Windows串口句柄。
+        if ser is not None and getattr(ser, 'is_open', False):
             try:
                 ser.close()
                 print(f'串口 {port} 已关闭')
             except Exception as e:
+                control.close_error = e
                 print(f'关闭串口失败: {e}')
+        control.clear_serial(ser)
+        if connected_event is not None:
+            connected_event.clear()
+        control.closed_event.set()
 
 # ==============================
 # 文件夹监听
@@ -1618,7 +1676,7 @@ class LogMarkerWindow(QDialog):
         self.main_window = main_window
         self.setWindowTitle('📍 日志打点')
         self.setAttribute(Qt.WA_DeleteOnClose, False)
-        self.resize(720, 320)
+        self.resize(480, 215)
         self._updating = False
 
         layout = QVBoxLayout(self)
@@ -1637,7 +1695,7 @@ class LogMarkerWindow(QDialog):
         layout.addLayout(controls)
 
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(('名称', '时间', '日志总行数', '目标行号', '日志前10字符'))
+        self.table.setHorizontalHeaderLabels(('名称', '时间', '日志总行数', '目标行号', '日志摘要（20字符）'))
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.verticalHeader().setVisible(False)
@@ -1886,7 +1944,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle('串口日志采集工具')
+        self.setWindowTitle('串口日志采集工具 v1.0.0.8')
         self.resize(1400, 800)
 
         # 串口相关
@@ -1898,6 +1956,7 @@ class MainWindow(QMainWindow):
         self.connected_event = threading.Event()
         self.log_connection_notified = False
         self.serial_thread = None
+        self.serial_control = None
 
         # 模组串口相关
         self.module_port = None
@@ -2010,6 +2069,8 @@ class MainWindow(QMainWindow):
 
         # 创建左右分割器
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(True)
+        self.main_splitter = splitter
 
         # ========== 左侧：工具栏 + 日志 ==========
         left_widget = QWidget()
@@ -2053,6 +2114,12 @@ class MainWindow(QMainWindow):
         self.main_functions_menu = QMenu(self.btn_more_functions)
         self.action_settings = self.main_functions_menu.addAction('⚙️ 参数设置')
         self.action_monitor = self.main_functions_menu.addAction('👁️ 启用图片监控')
+        self.image_paths_menu = self.main_functions_menu.addMenu('🖼️ 图片路径')
+        self.action_copy_output_path = self.image_paths_menu.addAction('复制图片保存路径')
+        self.action_open_output_path = self.image_paths_menu.addAction('跳转图片保存目录')
+        self.image_paths_menu.addSeparator()
+        self.action_copy_monitor_path = self.image_paths_menu.addAction('复制图片监控目录')
+        self.action_open_monitor_path = self.image_paths_menu.addAction('跳转图片监控目录')
         self.action_log_markers = self.main_functions_menu.addAction('📍 日志打点')
         self.main_functions_menu.addSeparator()
         self.action_save_log = self.main_functions_menu.addAction('💾 保存日志')
@@ -2061,6 +2128,10 @@ class MainWindow(QMainWindow):
         self.action_theme = self.main_functions_menu.addAction('🌙 切换至深色模式')
         self.action_settings.triggered.connect(self.open_settings_dialog)
         self.action_monitor.triggered.connect(self.toggle_monitoring)
+        self.action_copy_output_path.triggered.connect(self.copy_image_output_path)
+        self.action_open_output_path.triggered.connect(self.open_image_output_path)
+        self.action_copy_monitor_path.triggered.connect(self.copy_image_monitor_path)
+        self.action_open_monitor_path.triggered.connect(self.open_image_monitor_path)
         self.action_log_markers.triggered.connect(self.show_log_marker_window)
         self.action_save_log.triggered.connect(self.save_log_only)
         self.action_open_output.triggered.connect(self.open_output_directory)
@@ -2299,11 +2370,14 @@ class MainWindow(QMainWindow):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setMinimumWidth(400)
-        scroll_area.setMinimumHeight(300)
+        scroll_area.setMinimumHeight(220)
+        scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.image_container = QWidget()
+        self.image_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_layout = QVBoxLayout(self.image_container)
-        self.image_layout.setAlignment(Qt.AlignTop)
+        self.image_layout.setAlignment(Qt.AlignCenter)
+        self.image_layout.setContentsMargins(8, 8, 8, 8)
 
         self.no_image_label = QLabel('暂无图片\n\n启用图片监控后\n这里会显示检测到的图片')
         self.no_image_label.setAlignment(Qt.AlignCenter)
@@ -2313,18 +2387,15 @@ class MainWindow(QMainWindow):
         scroll_area.setWidget(self.image_container)
         preview_layout.addWidget(scroll_area)
 
-        # 图片信息
+        # 路径状态保留为兼容属性，不再占用预览区域的可见空间。
         self.image_info_label = QLabel('路径: 无')
-        self.image_info_label.setStyleSheet('color: #666666; font-size: 9pt; padding: 5px;')
-        self.image_info_label.setWordWrap(True)
-        preview_layout.addWidget(self.image_info_label)
-
+        self.image_info_label.setVisible(False)
         self.monitor_status_label = QLabel('图片监控：未启用')
         self.monitor_status_label.setObjectName('monitorStatusLabel')
-        self.monitor_status_label.setStyleSheet('font-size: 9pt; color: #666666; padding: 0 5px 4px 5px;')
-        preview_layout.addWidget(self.monitor_status_label)
+        self.monitor_status_label.setVisible(False)
 
-        right_layout.addWidget(preview_group)
+        preview_layout.setStretch(preview_layout.indexOf(scroll_area), 1)
+        right_layout.addWidget(preview_group, 1)
 
         # === 模组控制区域 ===
         module_outer_layout = QVBoxLayout()
@@ -2342,6 +2413,35 @@ class MainWindow(QMainWindow):
         self.btn_module_modes.setMenu(self.module_modes_menu)
         self.setup_module_modes_menu()
         module_header_layout.addWidget(self.btn_module_modes)
+
+        # 模组串口控制紧跟模式设置，减少内容区占用的垂直空间。
+        self.module_port_combo = QComboBox()
+        self.module_port_combo.setMinimumWidth(100)
+        self.module_port_combo.setToolTip('模组串口')
+        module_header_layout.addWidget(self.module_port_combo)
+
+        btn_refresh_module = QPushButton()
+        btn_refresh_module.setObjectName('refreshModulePortsButton')
+        btn_refresh_module.setProperty('compactButton', True)
+        btn_refresh_module.setIconSize(QSize(16, 16))
+        btn_refresh_module.setFixedSize(30, 28)
+        btn_refresh_module.setAccessibleName('刷新模组串口列表')
+        btn_refresh_module.setToolTip('刷新模组串口列表')
+        btn_refresh_module.clicked.connect(self.refresh_module_ports)
+        module_header_layout.addWidget(btn_refresh_module)
+
+        self.module_baudrate_combo = QComboBox()
+        self.module_baudrate_combo.setEditable(True)
+        self.module_baudrate_combo.addItems(['9600', '19200', '38400', '57600', '115200', '230400', '460800', '1500000', '921600'])
+        self.module_baudrate_combo.setCurrentText('115200')
+        self.module_baudrate_combo.setMinimumWidth(100)
+        self.module_baudrate_combo.setToolTip('模组波特率')
+        module_header_layout.addWidget(self.module_baudrate_combo)
+
+        self.btn_module_connect = QPushButton('🔌 连接模组')
+        self.btn_module_connect.clicked.connect(self.connect_module)
+        self.btn_module_connect.setStyleSheet('QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 12px; }')
+        module_header_layout.addWidget(self.btn_module_connect)
         module_header_layout.addStretch()
         module_outer_layout.addLayout(module_header_layout)
 
@@ -2353,55 +2453,12 @@ class MainWindow(QMainWindow):
         self.module_content_widget.layout().setContentsMargins(0, 0, 0, 0)
         self.module_content_widget.layout().addWidget(module_group)
 
-        # 模式选择移至标题右侧菜单，展开内容直接从串口配置开始
-        # 模组串口配置
-        module_serial_layout = QHBoxLayout()
-        module_serial_layout.addWidget(QLabel('模组串口:'))
-
-        self.module_port_combo = QComboBox()
-        self.module_port_combo.setMinimumWidth(100)
-        module_serial_layout.addWidget(self.module_port_combo)
-
-        btn_refresh_module = QPushButton()
-        btn_refresh_module.setObjectName('refreshModulePortsButton')
-        btn_refresh_module.setProperty('compactButton', True)
-        btn_refresh_module.setIconSize(QSize(16, 16))
-        btn_refresh_module.setFixedSize(30, 28)
-        btn_refresh_module.setAccessibleName('刷新模组串口列表')
-        btn_refresh_module.setToolTip('刷新串口列表')
-        btn_refresh_module.clicked.connect(self.refresh_module_ports)
-        module_serial_layout.addWidget(btn_refresh_module)
-
-        module_serial_layout.addWidget(QLabel('波特率:'))
-        self.module_baudrate_combo = QComboBox()
-        self.module_baudrate_combo.setEditable(True)
-        self.module_baudrate_combo.addItems(['9600', '19200', '38400', '57600', '115200', '230400', '460800', '1500000', '921600'])
-        self.module_baudrate_combo.setCurrentText('115200')
-        self.module_baudrate_combo.setMinimumWidth(100)
-        module_serial_layout.addWidget(self.module_baudrate_combo)
-
-        self.btn_module_connect = QPushButton('🔌 连接模组')
-        self.btn_module_connect.clicked.connect(self.connect_module)
-        self.btn_module_connect.setStyleSheet('QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 12px; }')
-        module_serial_layout.addWidget(self.btn_module_connect)
-
-        module_layout.addLayout(module_serial_layout)
-
-        # 模组状态
+        # 串口控制已移动到标题行；保留状态对象供业务逻辑和兼容调用使用，但不占用布局。
         self.module_status_label = QLabel('● 未连接')
-        self.module_status_label.setStyleSheet('font-size: 10pt; font-weight: bold; color: #999999;')
-        module_layout.addWidget(self.module_status_label)
+        self.module_status_label.setVisible(False)
+        self.module_status_label.setToolTip('模组连接状态通过连接按钮显示')
 
-        # 分隔线
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        module_layout.addWidget(line)
-
-        # 指令按钮区域 - 使用网格布局，从左到右排列
-        cmd_label = QLabel('模组指令:')
-        cmd_label.setStyleSheet('font-weight: bold;')
-        module_layout.addWidget(cmd_label)
+        # 指令按钮区域直接作为模组内容的第一部分。
 
         # 创建按钮容器，使用FlowLayout样式的网格布局
         button_container = QWidget()
@@ -2930,7 +2987,11 @@ class MainWindow(QMainWindow):
         # 刷新模组串口列表
         self.refresh_module_ports()
 
-        # 设置初始比例 - 左侧占更多空间
+        # 左右两侧都依据内容提示保持基本可用宽度；仍允许拖动折叠到0。
+        left_min_width = max(520, left_widget.sizeHint().width())
+        right_min_width = max(560, right_widget.sizeHint().width())
+        left_widget.setMinimumWidth(left_min_width)
+        right_scroll.setMinimumWidth(right_min_width)
         splitter.setStretchFactor(0, 7)
         splitter.setStretchFactor(1, 3)
 
@@ -3163,29 +3224,47 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'connection_timeout_timer') and self.connection_timeout_timer:
                 self.connection_timeout_timer.stop()
 
-            # 清空队列
-            while not self.log_queue.empty():
-                try:
-                    self.log_queue.get_nowait()
-                except:
-                    pass
-            while not self.error_queue.empty():
-                try:
-                    self.error_queue.get_nowait()
-                except:
-                    pass
+            # 请求线程停止并取消阻塞读取，再等待finally确认句柄已经关闭。
+            control = getattr(self, 'serial_control', None)
+            thread = self.serial_thread
+            if control:
+                control.request_stop()
+            else:
+                self.connected_event.clear()
 
-            # 重置连接事件
-            self.connected_event.clear()
+            if thread and thread.is_alive():
+                print('[调试] 等待串口线程释放句柄...')
+                if control:
+                    control.closed_event.wait(timeout=2.0)
+                thread.join(timeout=0.2)
 
-            # 等待线程结束（最多等待1秒）
-            if self.serial_thread and self.serial_thread.is_alive():
-                print('[调试] 等待串口线程结束...')
-                self.serial_thread.join(timeout=1.0)
-                if self.serial_thread.is_alive():
-                    print('[调试] 串口线程未能正常结束')
+            release_failed = bool(thread and thread.is_alive()) or bool(
+                control and control.close_error is not None
+            )
+            if release_failed:
+                print('[调试] 串口线程未能释放句柄')
+                self.btn_connect.setText('⌛ 正在释放...')
+                self.btn_connect.setEnabled(True)
+                self.set_status('● 正在释放串口', '#e08a00')
+                QMessageBox.warning(
+                    self, '断开未完成',
+                    '日志串口仍在释放中，请稍后再试；当前不会允许模组占用该串口。'
+                )
+                return False
 
             self.serial_thread = None
+            self.serial_control = None
+            self.connected_event.clear()
+            self.port = None
+            self.baudrate = None
+
+            # 句柄关闭后再清队列，避免工作线程在清理期间重新写入。
+            for pending_queue in (self.log_queue, self.error_queue, self.send_queue):
+                while True:
+                    try:
+                        pending_queue.get_nowait()
+                    except queue.Empty:
+                        break
 
             # 重置下载相关标志位
             self.end_download_performance('中止（断开连接）')
@@ -3206,10 +3285,12 @@ class MainWindow(QMainWindow):
             # 添加断开日志
             self.append_log('[系统] 已断开串口连接')
             print('[调试] 串口已断开')
+            return True
 
         except Exception as e:
             print(f'[调试] 断开串口时出错: {e}')
             QMessageBox.warning(self, '断开失败', f'断开串口时出错：\n{str(e)}')
+            return False
 
 
     def on_type_changed(self, index=None):
@@ -3965,9 +4046,11 @@ class MainWindow(QMainWindow):
         """启动串口线程"""
         self.connected_event.clear()
         self.log_connection_notified = False
+        self.serial_control = SerialReaderControl()
         self.serial_thread = threading.Thread(
             target=serial_reader,
-            args=(self.port, self.baudrate, self.error_queue, self.connected_event, self.log_queue, self.send_queue),
+            args=(self.port, self.baudrate, self.error_queue, self.connected_event,
+                  self.log_queue, self.send_queue, self.serial_control),
             daemon=True
         )
         self.serial_thread.start()
@@ -4246,62 +4329,126 @@ class MainWindow(QMainWindow):
             label = QLabel('该文件夹中没有找到图片文件')
             label.setAlignment(Qt.AlignCenter)
             label.setStyleSheet('color: #999999; padding: 20px;')
-            self.image_layout.addWidget(label)
+            self.image_layout.addWidget(label, 1)
             return
-
-        # 创建水平布局容器
-        h_layout = QHBoxLayout()
-        h_layout.setSpacing(10)
-        h_layout.setAlignment(Qt.AlignCenter)
 
         preview_paths = []
         # 保留实际显示的图片及顺序，排除无法加载的文件
+        valid_images = []
         for img_path in image_files:
             try:
                 pixmap = QPixmap(img_path)
                 if not pixmap.isNull():
-                    # 缩放图片
-                    scaled_pixmap = pixmap.scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-                    img_label = QLabel()
-                    img_label.setPixmap(scaled_pixmap)
-                    img_label.setAlignment(Qt.AlignCenter)
-                    img_label.setStyleSheet('border: 1px solid #ddd; padding: 5px; background: white;')
-
-                    # 设置为可点击
-                    img_label.setCursor(Qt.PointingHandCursor)
-                    img_label.setToolTip('双击查看大图')
-
-                    # 保存图片路径到标签
-                    img_label.setProperty('image_path', img_path)
-
-                    # 双击事件
-                    img_label.mouseDoubleClickEvent = (
-                        lambda event, path=img_path: self.open_image_viewer(path, preview_paths)
-                    )
-                    preview_paths.append(img_path)
-
-                    # 创建垂直容器（图片+文件名）
-                    v_container = QWidget()
-                    v_layout = QVBoxLayout(v_container)
-                    v_layout.setContentsMargins(0, 0, 0, 0)
-                    v_layout.addWidget(img_label)
-
-                    # 文件名
-                    name_label = QLabel(os.path.basename(img_path))
-                    name_label.setAlignment(Qt.AlignCenter)
-                    name_label.setStyleSheet('color: #666666; font-size: 9pt;')
-                    v_layout.addWidget(name_label)
-
-                    h_layout.addWidget(v_container)
+                    valid_images.append((img_path, pixmap))
             except Exception as e:
                 print(f'加载图片失败: {img_path}, {e}')
 
-        # 添加水平布局到主布局
-        h_layout.addStretch()
-        h_container = QWidget()
-        h_container.setLayout(h_layout)
-        self.image_layout.addWidget(h_container)
+        if not valid_images:
+            label = QLabel('该文件夹中没有找到可显示的图片文件')
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet('color: #999999; padding: 20px;')
+            self.image_layout.addWidget(label, 1)
+            return
+
+        max_columns = min(len(valid_images), 2)
+        preview_container = QWidget()
+        preview_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        preview_layout = QHBoxLayout(preview_container)
+        preview_layout.setContentsMargins(4, 4, 4, 4)
+        preview_layout.setSpacing(12)
+        preview_layout.setAlignment(Qt.AlignCenter)
+        for image_index, (img_path, pixmap) in enumerate(valid_images[:10]):
+            container_width = getattr(getattr(self, 'image_container', None), 'width', lambda: 800)()
+            container_height = getattr(getattr(self, 'image_container', None), 'height', lambda: 500)()
+            available_width = max(180, container_width // max_columns - 30)
+            available_height = max(180, container_height - 70)
+            scaled_pixmap = pixmap.scaled(available_width, available_height,
+                                          Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            img_label = QLabel()
+            img_label.setPixmap(scaled_pixmap)
+            img_label.setAlignment(Qt.AlignCenter)
+            img_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            img_label.setProperty('source_pixmap', pixmap)
+            img_label.setStyleSheet('border: 1px solid #ddd; padding: 5px; background: white;')
+            img_label.setCursor(Qt.PointingHandCursor)
+            img_label.setToolTip('双击查看大图')
+            img_label.setProperty('image_path', img_path)
+            img_label.mouseDoubleClickEvent = (
+                lambda event, path=img_path: self.open_image_viewer(path, preview_paths)
+            )
+            preview_paths.append(img_path)
+
+            v_container = QWidget()
+            v_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            v_layout = QVBoxLayout(v_container)
+            v_layout.setContentsMargins(0, 0, 0, 0)
+            v_layout.setAlignment(Qt.AlignCenter)
+            v_layout.addWidget(img_label, 1, Qt.AlignCenter)
+            name_label = QLabel(os.path.basename(img_path))
+            name_label.setAlignment(Qt.AlignCenter)
+            name_label.setStyleSheet('color: #666666; font-size: 9pt;')
+            v_layout.addWidget(name_label, 0, Qt.AlignCenter)
+            preview_layout.addWidget(v_container, 1)
+
+            if image_index == 0 and len(valid_images) >= 2:
+                divider = QFrame()
+                divider.setFrameShape(QFrame.VLine)
+                divider.setFrameShadow(QFrame.Sunken)
+                divider.setLineWidth(1)
+                divider.setStyleSheet('color: #999999;')
+                preview_layout.insertWidget(preview_layout.count() - 1, divider)
+
+        h_container = preview_container
+        self.image_layout.addWidget(h_container, 1)
+
+    def _image_path_value(self):
+        return self.output or self.output_base
+
+    def _copy_path(self, path, label):
+        if not path:
+            QMessageBox.information(self, '提示', f'{label}尚未配置，请先在参数设置中配置。')
+            return
+        QApplication.clipboard().setText(os.path.abspath(path))
+        self.append_log(f'[系统] 已复制{label}: {path}')
+
+    def _open_directory_path(self, path, label):
+        if not path:
+            QMessageBox.information(self, '提示', f'{label}尚未配置，请先在参数设置中配置。')
+            return
+        path = os.path.abspath(path)
+        if not os.path.isdir(path):
+            QMessageBox.warning(self, '提示', f'{label}不存在或尚未创建：\n{path}')
+            return
+        try:
+            if sys.platform == 'win32':
+                os.startfile(path)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', path])
+            else:
+                subprocess.Popen(['xdg-open', path])
+        except OSError as error:
+            QMessageBox.critical(self, '错误', f'打开{label}失败：\n{error}')
+
+    def copy_image_output_path(self):
+        self._copy_path(self._image_path_value(), '图片保存路径')
+
+    def open_image_output_path(self):
+        self._open_directory_path(self._image_path_value(), '图片保存目录')
+
+    def _require_monitoring(self):
+        if not self.monitoring_enabled:
+            QMessageBox.information(self, '提示', '请先启动图片监控目录！')
+            return False
+        return True
+
+    def copy_image_monitor_path(self):
+        if self._require_monitoring():
+            self._copy_path(self.download_dir, '图片监控目录')
+
+    def open_image_monitor_path(self):
+        if self._require_monitoring():
+            self._open_directory_path(self.download_dir, '图片监控目录')
 
     def open_image_viewer(self, image_path, image_paths=None):
         """打开图片查看器窗口"""
@@ -5331,6 +5478,17 @@ class MainWindow(QMainWindow):
             self.module_port_combo.addItem('无可用串口')
         self.module_port_combo.blockSignals(False)
 
+    def is_log_port_active(self, port=None):
+        """判断日志串口是否仍实际打开或处于关闭中的受保护阶段。"""
+        active_port = getattr(self, 'port', None)
+        if port is not None and port != active_port:
+            return False
+        control = getattr(self, 'serial_control', None)
+        thread = getattr(self, 'serial_thread', None)
+        if control is not None:
+            return control.is_active() or bool(thread and thread.is_alive())
+        return bool(thread and thread.is_alive()) or self.connected_event.is_set()
+
     def connect_module(self):
         """连接模组串口"""
         if self.module_connected:
@@ -5350,9 +5508,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, '提示', '波特率必须是数字')
             return
 
-        # 检查串口是否被日志串口占用
-        if port == self.port:
-            QMessageBox.warning(self, '提示', '该串口已被日志串口使用，请选择其他串口')
+        # 仅在日志串口仍实际打开或正在释放时阻止同端口复用。
+        if self.is_log_port_active(port):
+            QMessageBox.warning(self, '提示', '该串口已被日志串口使用，请先断开日志串口')
             return
 
         try:
@@ -7903,6 +8061,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """关闭事件"""
+        # 先释放日志串口，避免daemon线程依赖进程退出强制关闭句柄。
+        if self.is_log_port_active():
+            self.disconnect_serial()
+
         # 断开模组串口
         if self.module_connected:
             self.disconnect_module()
@@ -7927,7 +8089,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName('capLG')
-    app.setApplicationVersion('1.0.0.7')
+    app.setApplicationVersion('1.0.0.8')
     icon_name = 'ChatGPT Image 2026年9月16日 00_28_09.png'
     if getattr(sys, 'frozen', False):
         icon_path = os.path.join(sys._MEIPASS, 'resources', icon_name)
