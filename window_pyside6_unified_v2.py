@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QTextEdit, QComboBox, QLineEdit, QCheckBox,
     QRadioButton, QButtonGroup, QTabWidget, QMessageBox, QFileDialog,
     QDialog, QGroupBox, QFrame, QSplitter, QScrollArea, QSpinBox, QInputDialog,
-    QGridLayout, QMenu, QListWidget, QWidgetAction, QTableWidget,
+    QGridLayout, QMenu, QListWidget, QListWidgetItem, QWidgetAction, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QDialogButtonBox
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QSize, QEvent, QPoint
@@ -45,6 +45,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from config_manager import load_config, save_config
+import protocol_profiles as protocol_defs
 
 # ==============================
 # ANSI 转义序列清理
@@ -459,6 +460,365 @@ def _save_last_selection(data):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
+
+# ==============================
+# 协议组管理
+# ==============================
+
+class ProtocolProfilesDialog(QDialog):
+    """管理基于DSM继承的完整模组帧模板。"""
+
+    def __init__(self, profiles, current_profile_id, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('自定义协议组')
+        self.resize(1100, 720)
+        self.profiles = protocol_defs.clone_profiles(profiles)
+        self.current_profile_id = current_profile_id
+        self.editing_profile_id = None
+        self.editors = {'face': {}, 'palm': {}}
+        self.status_labels = {'face': {}, 'palm': {}}
+        self._loading = False
+        self._build_ui()
+        self._refresh_profile_list(current_profile_id)
+
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+
+        left = QVBoxLayout()
+        left.addWidget(QLabel('协议组:'))
+        self.profile_list = QListWidget()
+        self.profile_list.currentItemChanged.connect(self._on_profile_changed)
+        left.addWidget(self.profile_list, 1)
+
+        profile_buttons = QGridLayout()
+        self.btn_new_profile = QPushButton('新增')
+        self.btn_copy_profile = QPushButton('复制')
+        self.btn_delete_profile = QPushButton('删除')
+        self.btn_new_profile.clicked.connect(self._add_profile)
+        self.btn_copy_profile.clicked.connect(self._copy_profile)
+        self.btn_delete_profile.clicked.connect(self._delete_profile)
+        profile_buttons.addWidget(self.btn_new_profile, 0, 0)
+        profile_buttons.addWidget(self.btn_copy_profile, 0, 1)
+        profile_buttons.addWidget(self.btn_delete_profile, 1, 0, 1, 2)
+        left.addLayout(profile_buttons)
+
+        left_widget = QWidget()
+        left_widget.setLayout(left)
+        left_widget.setMinimumWidth(190)
+        root.addWidget(left_widget)
+
+        right = QVBoxLayout()
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel('协议组名称:'))
+        self.name_input = QLineEdit()
+        self.name_input.textEdited.connect(self._mark_dirty)
+        name_row.addWidget(self.name_input)
+        self.readonly_label = QLabel()
+        name_row.addWidget(self.readonly_label)
+        right.addLayout(name_row)
+
+        help_label = QLabel(
+            '静态指令填写完整帧，例如 EF AA 30 00 00 30；动态指令保留完整帧结构并使用占位符。'
+            '每个字节以空格分隔，保存时验证长度和XOR校验。'
+        )
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet('background-color: #e3f2fd; padding: 8px; border-radius: 4px;')
+        right.addWidget(help_label)
+
+        self.command_tabs = QTabWidget()
+        self.command_tabs.addTab(self._build_command_page('face'), '人脸指令')
+        self.command_tabs.addTab(self._build_command_page('palm'), '手掌指令')
+        right.addWidget(self.command_tabs, 1)
+
+        action_row = QHBoxLayout()
+        self.btn_restore_profile = QPushButton('当前组全部恢复继承')
+        self.btn_restore_profile.clicked.connect(self._restore_profile)
+        action_row.addWidget(self.btn_restore_profile)
+        action_row.addStretch()
+        self.btn_save_profile = QPushButton('保存当前组')
+        self.btn_save_profile.clicked.connect(self._save_current_profile)
+        action_row.addWidget(self.btn_save_profile)
+        right.addLayout(action_row)
+
+        dialog_buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        dialog_buttons.button(QDialogButtonBox.Ok).setText('应用并关闭')
+        dialog_buttons.button(QDialogButtonBox.Cancel).setText('取消')
+        dialog_buttons.accepted.connect(self._accept_changes)
+        dialog_buttons.rejected.connect(self.reject)
+        right.addWidget(dialog_buttons)
+
+        right_widget = QWidget()
+        right_widget.setLayout(right)
+        root.addWidget(right_widget, 1)
+
+    def _build_command_page(self, modality):
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        grid = QGridLayout(content)
+        grid.setColumnStretch(1, 1)
+        grid.addWidget(QLabel('功能'), 0, 0)
+        grid.addWidget(QLabel('完整帧 / 帧模板'), 0, 1)
+        grid.addWidget(QLabel('状态'), 0, 2)
+        grid.addWidget(QLabel(''), 0, 3)
+
+        for row, (function_key, spec) in enumerate(protocol_defs.FUNCTION_SPECS.items(), 1):
+            label = QLabel(spec.label)
+            editor = QLineEdit()
+            editor.setFont(QFont('Consolas', 9))
+            editor.setProperty('modality', modality)
+            editor.setProperty('functionKey', function_key)
+            editor.textEdited.connect(self._on_command_edited)
+            status = QLabel()
+            restore = QPushButton('恢复继承')
+            restore.setProperty('compactButton', True)
+            restore.clicked.connect(
+                lambda checked=False, m=modality, key=function_key: self._restore_field(m, key)
+            )
+            self.editors[modality][function_key] = editor
+            self.status_labels[modality][function_key] = status
+            grid.addWidget(label, row, 0)
+            grid.addWidget(editor, row, 1)
+            grid.addWidget(status, row, 2)
+            grid.addWidget(restore, row, 3)
+
+        grid.setRowStretch(grid.rowCount(), 1)
+        scroll.setWidget(content)
+        page_layout.addWidget(scroll)
+        return page
+
+    def _all_profile_rows(self):
+        rows = [
+            (protocol_defs.PROFILE_DSM, 'DSM（内置，只读）'),
+            (protocol_defs.PROFILE_KDS, 'KDS（内置，只读）'),
+        ]
+        rows.extend((profile['id'], profile['name']) for profile in self.profiles)
+        return rows
+
+    def _refresh_profile_list(self, selected_id=None):
+        self.profile_list.blockSignals(True)
+        self.profile_list.clear()
+        selected_row = 0
+        for row, (profile_id, name) in enumerate(self._all_profile_rows()):
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, profile_id)
+            self.profile_list.addItem(item)
+            if profile_id == selected_id:
+                selected_row = row
+        self.profile_list.setCurrentRow(selected_row)
+        self.profile_list.blockSignals(False)
+        self._load_profile(self.profile_list.currentItem().data(Qt.UserRole))
+
+    def _find_custom_profile(self, profile_id):
+        return next((profile for profile in self.profiles if profile['id'] == profile_id), None)
+
+    def _selected_profile_id(self):
+        item = self.profile_list.currentItem()
+        return item.data(Qt.UserRole) if item else protocol_defs.PROFILE_DSM
+
+    def _load_profile(self, profile_id):
+        self._loading = True
+        self.editing_profile_id = profile_id
+        builtin = profile_id in protocol_defs.BUILTIN_PROFILE_NAMES
+        profile = self._find_custom_profile(profile_id)
+        self.name_input.setText(protocol_defs.profile_name(profile_id, self.profiles))
+        self.name_input.setReadOnly(builtin)
+        self.readonly_label.setText('内置协议不可修改' if builtin else '自定义协议（继承DSM）')
+        self.btn_delete_profile.setEnabled(not builtin)
+        self.btn_restore_profile.setEnabled(not builtin)
+        self.btn_save_profile.setEnabled(not builtin)
+
+        for modality in protocol_defs.MODALITIES:
+            effective = protocol_defs.effective_templates(profile_id, modality, self.profiles)
+            overrides = profile.get('overrides', {}).get(modality, {}) if profile else {}
+            for function_key, editor in self.editors[modality].items():
+                editor.setText(effective[function_key])
+                editor.setReadOnly(builtin)
+                editor.setStyleSheet('')
+                if builtin:
+                    status = '内置'
+                elif function_key in overrides:
+                    status = '已覆盖'
+                else:
+                    status = '继承DSM'
+                self.status_labels[modality][function_key].setText(status)
+        self._loading = False
+
+    def _on_profile_changed(self, current, previous):
+        if self._loading or not current:
+            return
+        next_id = current.data(Qt.UserRole)
+        if (self.editing_profile_id and self.editing_profile_id != next_id
+                and self._find_custom_profile(self.editing_profile_id)):
+            # 切换列表前先把当前编辑内容写回内存；校验失败则留在原组。
+            original_row = next(
+                (row for row in range(self.profile_list.count())
+                 if self.profile_list.item(row).data(Qt.UserRole) == self.editing_profile_id),
+                0
+            )
+            if not self._save_current_profile(show_message=False, refresh=False,
+                                              profile_id=self.editing_profile_id):
+                self.profile_list.blockSignals(True)
+                self.profile_list.setCurrentRow(original_row)
+                self.profile_list.blockSignals(False)
+                return
+        self._load_profile(next_id)
+
+    def _unique_name(self, base):
+        names = {name.casefold() for _, name in self._all_profile_rows()}
+        candidate = base
+        index = 2
+        while candidate.casefold() in names:
+            candidate = f'{base} {index}'
+            index += 1
+        return candidate
+
+    def _save_editing_before_profile_action(self):
+        profile = self._find_custom_profile(self.editing_profile_id)
+        if not profile:
+            return True
+        return self._save_current_profile(
+            show_message=False, refresh=False, profile_id=profile['id']
+        )
+
+    def _add_profile(self):
+        if not self._save_editing_before_profile_action():
+            return
+        profile = protocol_defs.new_profile(self._unique_name('新协议组'))
+        self.profiles.append(profile)
+        self._refresh_profile_list(profile['id'])
+
+    def _copy_profile(self):
+        if not self._save_editing_before_profile_action():
+            return
+        source_id = self._selected_profile_id()
+        source_name = protocol_defs.profile_name(source_id, self.profiles)
+        profile = protocol_defs.new_profile(
+            self._unique_name(f'{source_name} 副本'), source_id, self.profiles
+        )
+        self.profiles.append(profile)
+        self._refresh_profile_list(profile['id'])
+
+    def _delete_profile(self):
+        profile_id = self._selected_profile_id()
+        profile = self._find_custom_profile(profile_id)
+        if not profile:
+            return
+        reply = QMessageBox.question(
+            self, '删除协议组', f'确定删除“{profile["name"]}”吗？',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.profiles.remove(profile)
+        if self.current_profile_id == profile_id:
+            self.current_profile_id = protocol_defs.PROFILE_DSM
+        self._refresh_profile_list(self.current_profile_id)
+
+    def _mark_dirty(self, text=''):
+        if not self._loading and self._find_custom_profile(self._selected_profile_id()):
+            self.btn_save_profile.setText('保存当前组 *')
+
+    def _on_command_edited(self, text):
+        editor = self.sender()
+        modality = editor.property('modality')
+        function_key = editor.property('functionKey')
+        editor.setStyleSheet('')
+        self.status_labels[modality][function_key].setText(
+            '已覆盖' if text.strip() else '继承DSM'
+        )
+        self._mark_dirty()
+
+    def _restore_field(self, modality, function_key):
+        profile = self._find_custom_profile(self._selected_profile_id())
+        if not profile:
+            return
+        profile.setdefault('overrides', {}).setdefault(modality, {}).pop(function_key, None)
+        self.editors[modality][function_key].setText(
+            protocol_defs.DSM_DEFAULTS[modality][function_key]
+        )
+        self.status_labels[modality][function_key].setText('继承DSM')
+        self._mark_dirty()
+
+    def _restore_profile(self):
+        profile = self._find_custom_profile(self._selected_profile_id())
+        if not profile:
+            return
+        profile['overrides'] = {'face': {}, 'palm': {}}
+        for modality in protocol_defs.MODALITIES:
+            for function_key in protocol_defs.FUNCTION_SPECS:
+                editor = self.editors[modality][function_key]
+                editor.setText(protocol_defs.DSM_DEFAULTS[modality][function_key])
+                self.status_labels[modality][function_key].setText('继承DSM')
+        self._mark_dirty()
+
+    def _validate_name(self, profile):
+        name = self.name_input.text().strip()
+        if not name:
+            raise ValueError('协议组名称不能为空')
+        for profile_id, other_name in self._all_profile_rows():
+            if profile_id != profile['id'] and other_name.replace('（内置，只读）', '').casefold() == name.casefold():
+                raise ValueError(f'协议组名称“{name}”已存在')
+        return name
+
+    def _save_current_profile(self, show_message=True, refresh=True, profile_id=None):
+        profile_id = profile_id or self.editing_profile_id or self._selected_profile_id()
+        profile = self._find_custom_profile(profile_id)
+        if not profile:
+            return True
+        try:
+            name = self._validate_name(profile)
+            overrides = {'face': {}, 'palm': {}}
+            for modality in protocol_defs.MODALITIES:
+                for function_key, editor in self.editors[modality].items():
+                    text = editor.text().strip()
+                    if not text:
+                        continue
+                    try:
+                        normalized = protocol_defs.normalize_template(text, function_key)
+                    except protocol_defs.ProtocolTemplateError as exc:
+                        raise protocol_defs.ProtocolTemplateError(
+                            f'{"人脸" if modality == "face" else "手掌"} / '
+                            f'{protocol_defs.FUNCTION_SPECS[function_key].label}: {exc}'
+                        ) from exc
+                    inherited = protocol_defs.DSM_DEFAULTS[modality][function_key]
+                    if normalized != inherited:
+                        overrides[modality][function_key] = normalized
+                    editor.setText(normalized)
+                    editor.setStyleSheet('')
+            profile['name'] = name
+            profile['overrides'] = overrides
+        except (ValueError, protocol_defs.ProtocolTemplateError) as exc:
+            if 'editor' in locals():
+                editor.setStyleSheet('border: 2px solid #d32f2f;')
+                self.command_tabs.setCurrentIndex(0 if modality == 'face' else 1)
+                editor.setFocus()
+            label = protocol_defs.FUNCTION_SPECS.get(function_key).label if 'function_key' in locals() else ''
+            QMessageBox.warning(
+                self, '协议组校验失败',
+                f'{"人脸" if modality == "face" else "手掌"} / {label}: {exc}'
+                if label else str(exc)
+            )
+            return False
+
+        self.btn_save_profile.setText('保存当前组')
+        current_id = profile['id']
+        if refresh:
+            self._refresh_profile_list(current_id)
+        self.editing_profile_id = current_id
+        if show_message:
+            QMessageBox.information(self, '协议组', '当前协议组已保存。')
+        return True
+
+    def _accept_changes(self):
+        if not self._save_current_profile(show_message=False):
+            return
+        if not protocol_defs.profile_exists(self.current_profile_id, self.profiles):
+            self.current_profile_id = protocol_defs.PROFILE_DSM
+        self.accept()
+
 
 # ==============================
 # 自定义命令发送对话框
@@ -1944,7 +2304,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle('串口日志采集工具 v1.0.0.8')
+        self.setWindowTitle('串口日志采集工具 v1.0.1.0')
         self.resize(1400, 800)
 
         # 串口相关
@@ -1967,6 +2327,14 @@ class MainWindow(QMainWindow):
         self.module_response_queue = queue.Queue()
         self.module_command_start_time = {}  # 跟踪每个指令的发送时间
         self.current_command_type = None  # 跟踪当前正在执行的命令类型（用于区分Note消息）
+        self.command_contexts = {}
+        self.active_command_context = None
+        self.protocol_task_profile_id = None
+        self.command_context_sequence = 0
+        self.protocol_profiles = []
+        self.protocol_profile_errors = []
+        self.active_protocol_profile_id = protocol_defs.PROFILE_DSM
+        self.protocol_profile_dialog = None
 
         # 图片下载相关
         self.image1_size = 0  # 第一张图片大小
@@ -2408,7 +2776,7 @@ class MainWindow(QMainWindow):
 
         self.btn_module_modes = QPushButton('⚙️ 模式设置')
         self.btn_module_modes.setAccessibleName('模组模式设置')
-        self.btn_module_modes.setToolTip('设置操作、RAW、项目、停止条件和重复次数')
+        self.btn_module_modes.setToolTip('设置操作、RAW、协议组、停止条件和重复次数')
         self.module_modes_menu = QMenu(self.btn_module_modes)
         self.btn_module_modes.setMenu(self.module_modes_menu)
         self.setup_module_modes_menu()
@@ -3097,6 +3465,20 @@ class MainWindow(QMainWindow):
 
     def setup_module_modes_menu(self):
         """构建模组模式菜单，作为模式状态的唯一UI来源。"""
+        config = load_config()
+        self.protocol_profiles, self.protocol_profile_errors = \
+            protocol_defs.sanitize_custom_profiles(config.get('protocol_profiles', []))
+        saved_profile = config.get('active_protocol_profile', protocol_defs.PROFILE_DSM)
+        # 兼容旧版本保存的项目模式值。
+        if saved_profile == 'DSM':
+            saved_profile = protocol_defs.PROFILE_DSM
+        elif saved_profile == 'KDS':
+            saved_profile = protocol_defs.PROFILE_KDS
+        self.active_protocol_profile_id = (
+            saved_profile if protocol_defs.profile_exists(saved_profile, self.protocol_profiles)
+            else protocol_defs.PROFILE_DSM
+        )
+
         _, self.operation_mode_group, self.operation_mode_actions = \
             self._add_exclusive_mode_menu(
                 '操作模式', (('face', '👤 人脸模式'), ('palm', '🖐️ 手掌模式')), 'face'
@@ -3106,10 +3488,7 @@ class MainWindow(QMainWindow):
                 'RAW 模式', (('Y+RGB', 'Y+RGB（40% + 60%）'),
                              ('Y+IR', 'Y+IR（50% + 50%）')), 'Y+IR'
             )
-        _, self.project_mode_group, self.project_mode_actions = \
-            self._add_exclusive_mode_menu(
-                '项目模式', (('DSM', 'DSM'), ('KDS', 'KDS')), 'DSM'
-            )
+        self.setup_protocol_profiles_menu()
         _, self.stop_condition_group, self.stop_condition_actions = \
             self._add_exclusive_mode_menu(
                 '停止条件', (('none', '不停止'), ('fail', '失败停止'),
@@ -3134,18 +3513,106 @@ class MainWindow(QMainWindow):
         self.module_modes_menu.addAction(repeat_action)
         self.update_module_mode_summary()
 
+    def setup_protocol_profiles_menu(self):
+        """创建或重建协议组选择菜单。"""
+        existing = getattr(self, 'protocol_profiles_menu', None)
+        if existing is None:
+            self.protocol_profiles_menu = self.module_modes_menu.addMenu('协议组')
+        else:
+            self.protocol_profiles_menu.clear()
+
+        previous_group = getattr(self, 'protocol_profile_group', None)
+        if previous_group is not None:
+            try:
+                previous_group.triggered.disconnect(self.on_protocol_profile_selected)
+            except (RuntimeError, TypeError):
+                pass
+            previous_group.deleteLater()
+        self.protocol_profile_group = QActionGroup(self)
+        self.protocol_profile_group.setExclusive(True)
+        self.protocol_profile_actions = {}
+        rows = [(key, value) for key, value in protocol_defs.BUILTIN_PROFILE_NAMES.items()]
+        rows.extend((profile['id'], profile['name']) for profile in self.protocol_profiles)
+        if not protocol_defs.profile_exists(self.active_protocol_profile_id, self.protocol_profiles):
+            self.active_protocol_profile_id = protocol_defs.PROFILE_DSM
+        for profile_id, name in rows:
+            action = self.protocol_profiles_menu.addAction(name)
+            action.setCheckable(True)
+            action.setData(profile_id)
+            action.setChecked(profile_id == self.active_protocol_profile_id)
+            self.protocol_profile_group.addAction(action)
+            self.protocol_profile_actions[profile_id] = action
+        self.protocol_profile_group.triggered.connect(self.on_protocol_profile_selected)
+        self.protocol_profiles_menu.addSeparator()
+        self.action_manage_protocol_profiles = self.protocol_profiles_menu.addAction('管理协议组…')
+        self.action_manage_protocol_profiles.triggered.connect(self.open_protocol_profiles_dialog)
+
+        # 兼容旧外围调用；生产逻辑不再依赖项目模式。
+        self.project_mode_group = self.protocol_profile_group
+        self.project_mode_actions = {
+            'DSM': self.protocol_profile_actions[protocol_defs.PROFILE_DSM],
+            'KDS': self.protocol_profile_actions[protocol_defs.PROFILE_KDS],
+        }
+
+    def protocol_change_locked(self):
+        return bool(self.repeat_mode or self.sequence_running or self.is_downloading
+                    or getattr(self, 'download_perf', None)
+                    or getattr(self, 'ota_in_progress', False))
+
+    def on_protocol_profile_selected(self, action):
+        profile_id = action.data()
+        if self.protocol_change_locked():
+            current = self.protocol_profile_actions.get(self.active_protocol_profile_id)
+            if current:
+                current.setChecked(True)
+            QMessageBox.warning(self, '协议组', '当前任务正在运行，暂时不能切换协议组。')
+            return
+        self.active_protocol_profile_id = profile_id
+        config = load_config()
+        config['active_protocol_profile'] = profile_id
+        save_config(config)
+        self.update_module_mode_summary()
+
+    def open_protocol_profiles_dialog(self):
+        if self.protocol_change_locked():
+            QMessageBox.warning(self, '协议组', '当前任务正在运行，暂时不能编辑协议组。')
+            return
+        dialog = ProtocolProfilesDialog(
+            self.protocol_profiles, self.active_protocol_profile_id, self
+        )
+        self.protocol_profile_dialog = dialog
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.protocol_profiles = protocol_defs.clone_profiles(dialog.profiles)
+        selected = dialog.current_profile_id
+        self.active_protocol_profile_id = (
+            selected if protocol_defs.profile_exists(selected, self.protocol_profiles)
+            else protocol_defs.PROFILE_DSM
+        )
+        config = load_config()
+        config['protocol_profiles'] = self.protocol_profiles
+        config['active_protocol_profile'] = self.active_protocol_profile_id
+        save_config(config)
+        self.setup_protocol_profiles_menu()
+        self.update_module_mode_summary()
+
     @staticmethod
     def _checked_action_key(actions):
         return next(key for key, action in actions.items() if action.isChecked())
 
+    def current_operation_modality(self):
+        return 'face' if self.operation_mode_actions['face'].isChecked() else 'palm'
+
     def update_module_mode_summary(self, checked=None):
         """同步模式按钮摘要和提示。"""
-        operation = '人脸' if self.operation_mode_actions['face'].isChecked() else '手掌'
+        operation = '人脸' if self.current_operation_modality() == 'face' else '手掌'
         raw = self._checked_action_key(self.raw_mode_actions)
-        project = self._checked_action_key(self.project_mode_actions)
+        profile = protocol_defs.profile_name(
+            self.active_protocol_profile_id, self.protocol_profiles
+        )
         stop_names = {'none': '不停止', 'fail': '失败停止', 'success': '成功停止'}
         stop = stop_names[self._checked_action_key(self.stop_condition_actions)]
-        summary = f'{operation} · {raw} · {project} · {stop} · {self.repeat_count_spin.value()}次'
+        summary = f'{operation} · {raw} · {profile} · {stop} · {self.repeat_count_spin.value()}次'
         self.btn_module_modes.setToolTip(summary)
         self.btn_module_modes.setAccessibleDescription(summary)
 
@@ -3444,6 +3911,9 @@ class MainWindow(QMainWindow):
             self.repeat_command = None
             self.repeat_success_count = 0
             self.repeat_reply_received = False
+            if not self.sequence_running and not self.is_downloading \
+                    and not getattr(self, 'ota_in_progress', False):
+                self.protocol_task_profile_id = None
             return
 
         # 检查是否还有剩余次数
@@ -3467,6 +3937,9 @@ class MainWindow(QMainWindow):
             self.repeat_command = None
             self.repeat_success_count = 0
             self.repeat_reply_received = False
+            if not self.sequence_running and not self.is_downloading \
+                    and not getattr(self, 'ota_in_progress', False):
+                self.protocol_task_profile_id = None
 
     def toggle_command_panel(self):
         """折叠/展开更多指令面板"""
@@ -5546,6 +6019,8 @@ class MainWindow(QMainWindow):
             self.btn_module_connect.setStyleSheet('QPushButton { background-color: #c0392b; color: white; font-weight: bold; padding: 6px 12px; }')
             self.module_port_combo.setEnabled(False)
             self.module_baudrate_combo.setEnabled(False)
+            self.command_contexts.clear()
+            self.active_command_context = None
 
             # 启用功能按钮
             self.btn_get_version.setEnabled(True)
@@ -5582,6 +6057,10 @@ class MainWindow(QMainWindow):
                 self.module_serial = None
 
             self.module_connected = False
+            if hasattr(self, 'command_contexts'):
+                self.command_contexts.clear()
+            self.active_command_context = None
+            self.protocol_task_profile_id = None
 
             # 停止响应轮询
             if hasattr(self, 'module_response_timer'):
@@ -5731,12 +6210,19 @@ class MainWindow(QMainWindow):
                 elif response[0] == 'reply':
                     # Reply消息: ('reply', msg_id, result, payload)
                     _, msg_id, result, payload = response[:4]
-                    if msg_id == 0x44 and len(response) > 4 and getattr(self, 'ota_perf', None):
+                    context = self._peek_command_context(msg_id) if hasattr(self, '_peek_command_context') else None
+                    function_key = context.get('function_key') if context else None
+                    if ((function_key == 'ota_packet' or (not context and msg_id == 0x44))
+                            and len(response) > 4 and getattr(self, 'ota_perf', None)):
                         self.record_ota_ack_timing(response[4])
-                    # 优化：下载期间减少打印
-                    # if not self.is_downloading or msg_id not in [0x18, 0x51]:
-                    #     print(f'[调试-Reply] msg_id=0x{msg_id:02X}, result=0x{result:02X}, payload长度={len(payload)}')
-                    self.module_response_signal.emit(f'0x{msg_id:02X}', ('reply', result, payload))
+                    canonical_id = msg_id
+                    if context:
+                        canonical_id = protocol_defs.canonical_response_mid(
+                            function_key, context['profile_id'], context['modality']
+                        )
+                    self.module_response_signal.emit(
+                        f'0x{canonical_id:02X}', ('reply', result, payload, context)
+                    )
                 elif response[0] == 'note':
                     # Note消息: ('note', data)
                     _, data = response
@@ -5745,13 +6231,19 @@ class MainWindow(QMainWindow):
                     self.module_response_signal.emit('note', ('note', 0, data))
                 elif response[0] == 'image_data':
                     _, data_size, img_data, timing = response
+                    if hasattr(self, '_take_function_context'):
+                        self._take_function_context('image_upload')
                     self.handle_image_data(data_size, img_data, timing)
         except queue.Empty:
             pass
 
     def handle_module_response(self, msg_id, data):
         """处理模组响应"""
-        msg_type, result, payload = data
+        msg_type, result, payload = data[:3]
+        command_context = data[3] if len(data) > 3 else None
+        function_key = command_context.get('function_key') if command_context else None
+        if command_context and hasattr(self, '_discard_command_context'):
+            self._discard_command_context(command_context)
 
         # 调试打印
         # print(f'[调试-处理响应] msg_id={msg_id}, msg_type={msg_type}, result={result if msg_type == "reply" else "N/A"}')
@@ -5765,41 +6257,51 @@ class MainWindow(QMainWindow):
         if msg_type != 'reply':
             return
 
-        # 清除超时定时器（收到响应说明指令成功）
-        if self.command_timeout_timer and self.command_timeout_timer.isActive():
-            self.command_timeout_timer.stop()
-
-        # 清除待响应指令记录
+        # 只在回复确实匹配待响应指令时停止其超时计时器。
+        reply_matches_pending = False
         if self.pending_command:
-            pending_msg_id = self.pending_command[0]
-            # 检查响应的msg_id是否匹配待响应的指令
+            pending_msg_id = (self.pending_command.get('msg_id')
+                              if isinstance(self.pending_command, dict)
+                              else self.pending_command[0])
             try:
-                current_msg_id = int(msg_id, 16)
-                if current_msg_id == pending_msg_id:
-                    self.pending_command = None
-            except:
+                actual_msg_id = (command_context.get('msg_id') if command_context
+                                 else int(msg_id, 16))
+                reply_matches_pending = actual_msg_id == pending_msg_id
+            except (ValueError, TypeError):
                 pass
+        if reply_matches_pending:
+            if self.command_timeout_timer and self.command_timeout_timer.isActive():
+                self.command_timeout_timer.stop()
+            self.pending_command = None
 
         if (getattr(self, 'download_perf', None) and result != 0x00
-                and msg_id in ('0x14', '0x15', '0x51')):
+                and (function_key in ('get_jpeg_size', 'get_raw_size', 'set_baudrate')
+                     or (not command_context and msg_id in ('0x14', '0x15', '0x51')))):
             self.is_downloading = False
             self.end_download_performance(f'中止（{msg_id} 返回失败）')
 
-        if msg_id == '0x51' and result != 0x00 and getattr(self, 'ota_perf', None):
+        if (function_key == 'set_baudrate' or (not command_context and msg_id == '0x51')) \
+                and result != 0x00 and getattr(self, 'ota_perf', None):
             self.finish_ota('中止（设置波特率失败）')
-        if msg_id in ('0x40', '0x43'):
-            expected_stage = 2 if msg_id == '0x40' else 3
+        if function_key in ('ota_enter', 'ota_header') or (not command_context and msg_id in ('0x40', '0x43')):
+            stage_function = function_key
+            if stage_function is None:
+                stage_function = 'ota_enter' if msg_id == '0x40' else 'ota_header'
+            expected_stage = 2 if stage_function == 'ota_enter' else 3
             if not self.ota_in_progress or self.ota_stage != expected_stage:
                 return
 
-        # 计算时长
-        elapsed_time = self.get_command_elapsed_time(msg_id)
+        # 计算时长；自定义MID上下文保存实际发送时间。
+        if command_context:
+            elapsed_time = f'(耗时: {time.time() - command_context["sent_at"]:.2f}s)'
+            self.module_command_start_time.pop(command_context['msg_id'], None)
+        else:
+            elapsed_time = self.get_command_elapsed_time(msg_id)
 
-        if msg_id == '0x30':  # 获取版本号
+        if function_key == 'get_version' or (not command_context and msg_id == '0x30'):  # 获取版本号
             if result == 0x00:
                 # 成功，解析版本号
-
-                version = payload[:-1].decode('utf-8', errors='ignore').rstrip('\x00')
+                version = payload.decode('utf-8', errors='ignore').rstrip('\x00')
                 self.append_module_log(f'[版本号] {version} {elapsed_time}', success=True)
                 # 检查是否需要执行序列的下一步
                 self.check_sequence_next('获取版本号')
@@ -5808,7 +6310,10 @@ class MainWindow(QMainWindow):
                 self.append_module_log(f'[错误] 获取版本号失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
                 self.check_sequence_next('获取版本号')
 
-        elif msg_id == '0x24':  # 获取所有用户ID
+        elif ((function_key == 'get_all_user_ids' and command_context
+               and command_context.get('response_variant') == 'dsm'
+               and command_context.get('modality') == 'face')
+              or (not command_context and msg_id == '0x24')):  # 获取所有用户ID
             if result == 0x00:
                 # 成功，解析用户ID列表
                 # payload格式：第1个字节是用户数量，后面每2个字节是一个用户ID（大端序）
@@ -5839,7 +6344,9 @@ class MainWindow(QMainWindow):
             # 检查是否需要执行序列的下一步
             self.check_sequence_next('获取所有用户ID')
 
-        elif msg_id == '0x1D':  # 单帧注册
+        elif ((function_key == 'register' and command_context
+               and command_context.get('modality') == 'face')
+              or (not command_context and msg_id == '0x1D')):  # 单帧注册
             if result == 0x00:
                 # 注册成功，解析用户ID（紧跟result后面的2字节）
                 if len(payload) >= 2:
@@ -5876,7 +6383,9 @@ class MainWindow(QMainWindow):
                 # 注册失败也触发序列下一步（可根据需求修改）
                 self.check_sequence_next('人脸注册')
 
-        elif msg_id == '0x12':  # 人脸识别
+        elif ((function_key == 'recognize' and command_context
+               and command_context.get('modality') == 'face')
+              or (not command_context and msg_id == '0x12')):  # 人脸识别
             if result == 0x00:
                 # 识别成功，解析用户ID（紧跟result后面的2字节）
                 if len(payload) >= 2:
@@ -5921,7 +6430,7 @@ class MainWindow(QMainWindow):
                 # 识别失败也触发序列下一步
                 self.check_sequence_next('识别D')
 
-        elif msg_id == '0x51':  # 设置波特率
+        elif function_key == 'set_baudrate' or (not command_context and msg_id == '0x51'):  # 设置波特率
             # 添加调试信息
             print(f'[调试-0x51] result=0x{result:02X}, payload长度={len(payload)}, payload={payload.hex().upper() if payload else "空"}')
 
@@ -5939,6 +6448,20 @@ class MainWindow(QMainWindow):
                 if len(payload) >= 1:
                     baudrate_code = payload[0]
                     print(f'[调试-0x51] 从payload读取波特率代码: 0x{baudrate_code:02X}')
+                elif command_context:
+                    # 自定义完整帧可能改变固定data布局；目标波特率优先取流程状态，
+                    # 常规下载则根据当前阶段判断高速/恢复。
+                    if self.ota_in_progress:
+                        baudrate_code = {
+                            115200: 0x01, 230400: 0x02,
+                            460800: 0x03, 1500000: 0x04,
+                        }.get(getattr(self, 'ota_target_baudrate', 1500000), 0x04)
+                    elif getattr(self, 'is_standby_restoring', False):
+                        baudrate_code = 0x01
+                    elif self.download_offset >= self.download_total_size and self.download_total_size > 0:
+                        baudrate_code = 0x01
+                    else:
+                        baudrate_code = 0x04
                 else:
                     # payload为空，从当前下载状态推断
                     print(f'[调试-0x51] payload为空，从下载状态推断')
@@ -6045,7 +6568,7 @@ class MainWindow(QMainWindow):
             else:
                 self.append_module_log(f'设置波特率失败 {elapsed_time}', error=True)
 
-        elif msg_id == '0x14':  # 获取JPEG图片大小
+        elif function_key == 'get_jpeg_size' or (not command_context and msg_id == '0x14'):  # 获取JPEG图片大小
             if result == 0x00:
                 # 成功，解析图片大小
                 # payload后8个字节：前4字节是第一张图片大小，后4字节是第二张图片大小
@@ -6066,7 +6589,7 @@ class MainWindow(QMainWindow):
             else:
                 self.append_module_log(f'[错误] 获取图片大小失败 {elapsed_time}', error=True)
 
-        elif msg_id == '0x15':  # 获取RAW图片大小
+        elif function_key == 'get_raw_size' or (not command_context and msg_id == '0x15'):  # 获取RAW图片大小
             if result == 0x00:
                 # 成功，解析RAW图总大小
                 # payload是4个字节：表示两张图片的总大小
@@ -6097,7 +6620,7 @@ class MainWindow(QMainWindow):
             else:
                 self.append_module_log(f'[错误] 获取RAW图大小失败 {elapsed_time}', error=True)
 
-        elif msg_id == '0x18':  # 图片上传指令的回复（错误情况）
+        elif function_key == 'image_upload' or (not command_context and msg_id == '0x18'):  # 图片上传指令的回复（错误情况）
             # 在正常传输过程中收到reply消息说明出错了，需要重传
             print(f'[调试-0x18] 收到回复消息，传输出错，result=0x{result:02X}')
             self.append_module_log(f'[警告] 图片传输出错，1秒后重传... (错误码: 0x{result:02X})')
@@ -6112,7 +6635,10 @@ class MainWindow(QMainWindow):
             self.retry_timer.timeout.connect(self.retry_last_upload)
             self.retry_timer.start(1000)  # 1秒后重传
 
-        elif msg_id == '0x62':  # 手掌注册
+        elif ((function_key == 'register' and command_context
+               and command_context.get('modality') == 'palm'
+               and command_context.get('response_variant') == 'dsm')
+              or (not command_context and msg_id == '0x62')):  # 手掌注册
             if result == 0x00:
                 # 注册成功，payload是用户ID（2字节）
                 if len(payload) >= 2:
@@ -6148,7 +6674,10 @@ class MainWindow(QMainWindow):
                 # 注册失败也触发序列下一步
                 self.check_sequence_next('手掌注册')
 
-        elif msg_id == '0x63':  # 手掌识别
+        elif ((function_key == 'recognize' and command_context
+               and command_context.get('modality') == 'palm'
+               and command_context.get('response_variant') == 'dsm')
+              or (not command_context and msg_id == '0x63')):  # 手掌识别
             if result == 0x00:
                 # 识别成功，payload包含36字节：[用户ID 2字节][用户名 32字节][是否管理员 1字节][解锁状态 1字节]
                 if len(payload) >= 36:
@@ -6210,7 +6739,10 @@ class MainWindow(QMainWindow):
                 # 识别失败也触发序列下一步
                 self.check_sequence_next('识别K')
 
-        elif msg_id == '0x64':  # 手掌获取已注册用户列表
+        elif ((function_key == 'get_all_user_ids' and command_context
+               and command_context.get('modality') == 'palm'
+               and command_context.get('response_variant') == 'dsm')
+              or (not command_context and msg_id == '0x64')):  # 手掌获取已注册用户列表
             if result == 0x00:
                 # 成功，payload格式：[用户数量 2字节][用户ID1 2字节][用户ID2 2字节]...
                 if len(payload) >= 2:
@@ -6243,8 +6775,11 @@ class MainWindow(QMainWindow):
                     self.append_module_log(f'获取已注册用户列表成功，但数据长度不足 {elapsed_time}', error=True)
             else:
                 self.append_module_log(f'获取已注册用户列表失败 {elapsed_time}', error=True)
+            self.check_sequence_next('获取所有用户ID')
 
-        elif msg_id == '0x20':  # 人脸删除指定用户ID
+        elif ((function_key == 'delete_user' and command_context
+               and command_context.get('modality') == 'face')
+              or (not command_context and msg_id == '0x20')):  # 人脸删除指定用户ID
             if result == 0x00:
                 self.append_module_log(f'[人脸模式] 删除用户成功 {elapsed_time}', success=True)
             else:
@@ -6252,7 +6787,9 @@ class MainWindow(QMainWindow):
             # 检查是否需要执行序列的下一步
             self.check_sequence_next('删除指定用户ID')
 
-        elif msg_id == '0x21':  # 人脸删除所有用户
+        elif ((function_key == 'delete_all' and command_context
+               and command_context.get('modality') == 'face')
+              or (not command_context and msg_id == '0x21')):  # 人脸删除所有用户
             if result == 0x00:
                 self.append_module_log(f'[人脸模式] 删除所有用户成功 {elapsed_time}', success=True)
             else:
@@ -6260,7 +6797,10 @@ class MainWindow(QMainWindow):
             # 检查是否需要执行序列的下一步
             self.check_sequence_next('删除所有用户')
 
-        elif msg_id == '0x65':  # 手掌删除指定用户ID
+        elif ((function_key == 'delete_user' and command_context
+               and command_context.get('modality') == 'palm'
+               and command_context.get('response_variant') == 'dsm')
+              or (not command_context and msg_id == '0x65')):  # 手掌删除指定用户ID
             if result == 0x00:
                 self.append_module_log(f'[手掌模式] 删除用户成功 {elapsed_time}', success=True)
             else:
@@ -6268,7 +6808,10 @@ class MainWindow(QMainWindow):
             # 检查是否需要执行序列的下一步
             self.check_sequence_next('删除指定用户ID')
 
-        elif msg_id == '0x66':  # 手掌删除所有用户
+        elif ((function_key == 'delete_all' and command_context
+               and command_context.get('modality') == 'palm'
+               and command_context.get('response_variant') == 'dsm')
+              or (not command_context and msg_id == '0x66')):  # 手掌删除所有用户
             if result == 0x00:
                 self.append_module_log(f'[手掌模式] 删除所有用户成功 {elapsed_time}', success=True)
             else:
@@ -6276,7 +6819,7 @@ class MainWindow(QMainWindow):
             # 检查是否需要执行序列的下一步
             self.check_sequence_next('删除所有用户')
 
-        elif msg_id == '0x55':  # 重启模组
+        elif function_key == 'restart' or (not command_context and msg_id == '0x55'):  # 重启模组
             if result == 0x00:
                 self.append_module_log(f'[重启模组] 重启成功 {elapsed_time}', success=True)
             else:
@@ -6284,7 +6827,7 @@ class MainWindow(QMainWindow):
             # 检查是否需要执行序列的下一步
             self.check_sequence_next('重启模组')
 
-        elif msg_id == '0x10':  # 待机
+        elif function_key == 'standby' or (not command_context and msg_id == '0x10'):  # 待机
             if result == 0x00:
                 self.append_module_log(f'[待机] 待机成功 {elapsed_time}', success=True)
                 # 检查是否需要执行序列的下一步
@@ -6294,7 +6837,10 @@ class MainWindow(QMainWindow):
                 # 失败也触发下一步
                 self.check_sequence_next('待机')
 
-        elif msg_id == '0x80':  # KDS手掌注册
+        elif ((function_key == 'register' and command_context
+               and command_context.get('modality') == 'palm'
+               and command_context.get('response_variant') == 'kds')
+              or (not command_context and msg_id == '0x80')):  # KDS手掌注册
             if result == 0x00:
                 # 注册成功，解析用户ID（紧跟result后面的2字节）
                 if len(payload) >= 2:
@@ -6309,10 +6855,14 @@ class MainWindow(QMainWindow):
             else:
                 self.append_module_log(f'[KDS手掌注册] 注册失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
 
-            # 检查是否需要继续重复执行
-            self.check_repeat_next()
+            # 检查是否需要继续重复执行，并推进自动序列。
+            self.check_repeat_next(last_success=(result == 0x00))
+            self.check_sequence_next('手掌注册')
 
-        elif msg_id == '0x81':  # KDS手掌识别
+        elif ((function_key == 'recognize' and command_context
+               and command_context.get('modality') == 'palm'
+               and command_context.get('response_variant') == 'kds')
+              or (not command_context and msg_id == '0x81')):  # KDS手掌识别
             if result == 0x00:
                 # 识别成功，解析用户ID（紧跟result后面的2字节）
                 if len(payload) >= 2:
@@ -6345,23 +6895,35 @@ class MainWindow(QMainWindow):
                 self.append_module_log(f'识别失败: {error_msg} {elapsed_time}', error=True)
                 # self.append_module_log(f'[KDS手掌识别] 识别失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
 
-            # 检查是否需要继续重复执行
+            # 检查是否需要继续重复执行，并推进自动序列。
             if result != 0x23:
-                self.check_repeat_next()
+                self.check_repeat_next(last_success=(result == 0x00))
+                self.check_sequence_next('识别K')
 
-        elif msg_id == '0x82':  # KDS删除所有用户
+        elif ((function_key == 'delete_all' and command_context
+               and command_context.get('modality') == 'palm'
+               and command_context.get('response_variant') == 'kds')
+              or (not command_context and msg_id == '0x82')):  # KDS删除所有用户
             if result == 0x00:
                 self.append_module_log(f'[KDS手掌模式] 删除所有用户成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[KDS手掌模式] 删除所有用户失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+            self.check_sequence_next('删除所有用户')
 
-        elif msg_id == '0x83':  # KDS删除指定用户ID
+        elif ((function_key == 'delete_user' and command_context
+               and command_context.get('modality') == 'palm'
+               and command_context.get('response_variant') == 'kds')
+              or (not command_context and msg_id == '0x83')):  # KDS删除指定用户ID
             if result == 0x00:
                 self.append_module_log(f'[KDS手掌模式] 删除用户成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[KDS手掌模式] 删除用户失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
+            self.check_sequence_next('删除指定用户ID')
 
-        elif msg_id == '0x84':  # KDS获取所有用户ID
+        elif ((function_key == 'get_all_user_ids' and command_context
+               and command_context.get('modality') == 'palm'
+               and command_context.get('response_variant') == 'kds')
+              or (not command_context and msg_id == '0x84')):  # KDS获取所有用户ID
             if result == 0x00:
                 if len(payload) >= 2:
                     # 用户数量：前2字节，小端序
@@ -6393,26 +6955,31 @@ class MainWindow(QMainWindow):
                     self.append_module_log(f'[KDS] 获取已注册用户列表成功，但数据长度不足 {elapsed_time}', error=True)
             else:
                 self.append_module_log(f'[KDS] 获取已注册用户列表失败 {elapsed_time}', error=True)
+            self.check_sequence_next('获取所有用户ID')
 
-        elif msg_id == '0xFE':  # 演示模式
+        elif function_key in ('enter_demo', 'exit_demo') or (not command_context and msg_id == '0xFE'):  # 演示模式
             if result == 0x00:
                 self.append_module_log(f'[演示模式] 操作成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[演示模式] 操作失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
-            # 检查是否需要执行序列的下一步（进入演示和退出演示都使用同一个msg_id）
-            self.check_sequence_next('进入演示')
-            self.check_sequence_next('退出演示')
+            if function_key:
+                self.check_sequence_next('进入演示' if function_key == 'enter_demo' else '退出演示')
+            else:
+                self.check_sequence_next('进入演示')
+                self.check_sequence_next('退出演示')
 
-        elif msg_id == '0xF0':  # Debug模式
+        elif function_key in ('enter_debug', 'exit_debug') or (not command_context and msg_id == '0xF0'):  # Debug模式
             if result == 0x00:
                 self.append_module_log(f'[Debug模式] 操作成功 {elapsed_time}', success=True)
             else:
                 self.append_module_log(f'[Debug模式] 操作失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
-            # 检查是否需要执行序列的下一步（进入Debug和退出Debug都使用同一个msg_id）
-            self.check_sequence_next('进入Debug')
-            self.check_sequence_next('退出Debug')
+            if function_key:
+                self.check_sequence_next('进入Debug' if function_key == 'enter_debug' else '退出Debug')
+            else:
+                self.check_sequence_next('进入Debug')
+                self.check_sequence_next('退出Debug')
 
-        elif msg_id == '0x40':  # 进入OTA状态
+        elif function_key == 'ota_enter' or (not command_context and msg_id == '0x40'):  # 进入OTA状态
             print(f'[OTA调试] 收到0x40响应: result=0x{result:02X}, payload长度={len(payload)}')
             if len(payload) > 0:
                 print(f'[OTA调试] payload: {payload.hex().upper()}')
@@ -6426,7 +6993,7 @@ class MainWindow(QMainWindow):
                 self.append_module_log(f'[OTA] 进入OTA状态失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
                 self.finish_ota('中止（进入OTA失败）')
 
-        elif msg_id == '0x43':  # OTA header
+        elif function_key == 'ota_header' or (not command_context and msg_id == '0x43'):  # OTA header
             print(f'[OTA调试] 收到0x43响应: result=0x{result:02X}, payload长度={len(payload)}')
             if len(payload) > 0:
                 print(f'[OTA调试] payload: {payload.hex().upper()}')
@@ -6442,7 +7009,7 @@ class MainWindow(QMainWindow):
                 self.append_module_log(f'[OTA] OTA header发送失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
                 self.finish_ota('中止（header失败）')
 
-        elif msg_id == '0x44':  # OTA固件包传输
+        elif function_key == 'ota_packet' or (not command_context and msg_id == '0x44'):  # OTA固件包传输
             if not (self.ota_in_progress and self.ota_stage == 4 and self.ota_waiting_ack):
                 return
             self.ota_waiting_ack = False
@@ -6559,7 +7126,10 @@ class MainWindow(QMainWindow):
                     self.finish_ota('中止（模组重启失败）')
                 return
 
-            # 判断是人脸还是手掌
+            # 判断是人脸还是手掌。自定义协议可通过发送上下文复用现有Note解析。
+            active_context = getattr(self, 'active_command_context', None)
+            note_variant = active_context.get('response_variant') if active_context else None
+            note_modality = active_context.get('modality') if active_context else None
             if nid == 0x01:  # 人脸Note消息
                 # 第1字节是固定字段0x01，第2字节是第一个状态信息
                 status = data[1]
@@ -6596,14 +7166,14 @@ class MainWindow(QMainWindow):
                 status_msg = status_messages.get(status, f'未知状态 ({status})')
 
                 # 根据当前命令类型显示不同的状态前缀
-                if self.current_command_type == 0x1D:
+                if self.current_command_type in (0x1D, 'register'):
                     self.append_module_log(f'[注册状态] {status_msg}')
-                elif self.current_command_type == 0x12:
+                elif self.current_command_type in (0x12, 'recognize'):
                     self.append_module_log(f'[识别状态] {status_msg}')
                 else:
                     self.append_module_log(f'[状态] {status_msg}')
 
-            elif nid == 0x04:  # 手掌Note消息（DSM模式）
+            elif nid == 0x04 or (note_modality == 'palm' and note_variant == 'dsm'):  # 手掌Note消息（DSM模式）
                 # 第1字节是0x04，第2字节是状态信息
                 status = data[1]
 
@@ -6642,7 +7212,7 @@ class MainWindow(QMainWindow):
                 status_msg = palm_status_messages.get(status, f'未知错误 (0x{status:02X})')
                 self.append_module_log(f'[手掌状态] {status_msg}')
 
-            elif nid == 0x08:  # 手掌Note消息（KDS模式）
+            elif nid == 0x08 or (note_modality == 'palm' and note_variant == 'kds'):  # 手掌Note消息（KDS模式）
                 # 第1字节是0x05，第2字节是状态信息
                 status = data[1]
 
@@ -6686,6 +7256,123 @@ class MainWindow(QMainWindow):
         else:
             self.append_module_log('[错误] Note消息数据长度不足', error=True)
 
+    def get_protocol_profile_name(self, profile_id=None):
+        return protocol_defs.profile_name(
+            profile_id or self.active_protocol_profile_id, self.protocol_profiles
+        )
+
+    def resolve_protocol_packet(self, function_key, modality=None, runtime_values=None,
+                                profile_id=None):
+        """根据当前协议组渲染可直接写串口的完整帧。"""
+        modality = modality or self.current_operation_modality()
+        profile_id = profile_id or self.active_protocol_profile_id
+        return protocol_defs.resolve_packet(
+            profile_id, modality, function_key, self.protocol_profiles, runtime_values
+        )
+
+    def _store_command_context(self, msg_id, function_key, modality, packet, profile_id):
+        self.command_context_sequence += 1
+        context = {
+            'sequence': self.command_context_sequence,
+            'msg_id': msg_id,
+            'function_key': function_key,
+            'modality': modality,
+            'profile_id': profile_id,
+            'profile_name': self.get_protocol_profile_name(profile_id),
+            'response_variant': protocol_defs.response_variant(profile_id, modality),
+            'packet': bytes(packet),
+            'sent_at': time.time(),
+        }
+        self.command_contexts.setdefault(msg_id, deque()).append(context)
+        self.active_command_context = context
+        return context
+
+    def _take_command_context(self, msg_id):
+        contexts = self.command_contexts.get(msg_id)
+        if not contexts:
+            return None
+        context = contexts.popleft()
+        if not contexts:
+            self.command_contexts.pop(msg_id, None)
+        if self.active_command_context is context:
+            self.active_command_context = None
+        return context
+
+    def _peek_command_context(self, msg_id):
+        contexts = self.command_contexts.get(msg_id)
+        return contexts[0] if contexts else None
+
+    def _take_function_context(self, function_key):
+        """移除最早的指定语义上下文（用于无MID的图片数据响应）。"""
+        candidates = [
+            context
+            for contexts in self.command_contexts.values()
+            for context in contexts
+            if context.get('function_key') == function_key
+        ]
+        if not candidates:
+            return None
+        context = min(candidates, key=lambda item: item.get('sequence', 0))
+        self._discard_command_context(context)
+        return context
+
+    def _discard_command_context(self, context):
+        if not context:
+            return
+        contexts = self.command_contexts.get(context.get('msg_id'))
+        if contexts:
+            try:
+                contexts.remove(context)
+            except ValueError:
+                pass
+            if not contexts:
+                self.command_contexts.pop(context.get('msg_id'), None)
+        if self.active_command_context is context:
+            self.active_command_context = None
+
+    def send_protocol_command(self, function_key, modality=None, runtime_values=None,
+                              retry_context=None):
+        """按协议组发送完整帧，并登记自定义MID的响应语义。"""
+        if retry_context is not None:
+            packet = retry_context['packet']
+            msg_id = retry_context['msg_id']
+            modality = retry_context['modality']
+            profile_id = retry_context['profile_id']
+        else:
+            modality = modality or self.current_operation_modality()
+            task_profile = getattr(self, 'protocol_task_profile_id', None)
+            if self.protocol_change_locked():
+                if task_profile is None:
+                    self.protocol_task_profile_id = self.active_protocol_profile_id
+                    task_profile = self.protocol_task_profile_id
+                profile_id = task_profile
+            else:
+                self.protocol_task_profile_id = None
+                profile_id = self.active_protocol_profile_id
+            try:
+                packet, msg_id = self.resolve_protocol_packet(
+                    function_key, modality, runtime_values, profile_id
+                )
+            except (KeyError, protocol_defs.ProtocolTemplateError) as exc:
+                profile_name = self.get_protocol_profile_name(profile_id)
+                label = protocol_defs.FUNCTION_SPECS.get(function_key)
+                label = label.label if label else function_key
+                QMessageBox.warning(
+                    self, '协议指令错误',
+                    f'协议组“{profile_name}”的“{label}”指令无效：\n{exc}'
+                )
+                return False
+
+        context = self._store_command_context(
+            msg_id, function_key, modality, packet, profile_id
+        )
+        if retry_context is not None:
+            context['sequence'] = retry_context.get('sequence', context['sequence'])
+        if not self.send_module_packet(packet, context):
+            self._discard_command_context(context)
+            return False
+        return True
+
     def get_command_elapsed_time(self, msg_id):
         """获取指令执行时长
 
@@ -6709,12 +7396,16 @@ class MainWindow(QMainWindow):
         return ''
 
     def send_module_command(self, msg_id, data=b''):
-        """发送模组指令
+        """兼容入口：按固定线协议构建完整帧并发送。"""
+        try:
+            packet = protocol_defs.build_packet(msg_id, data)
+        except protocol_defs.ProtocolTemplateError as exc:
+            QMessageBox.warning(self, '协议指令错误', str(exc))
+            return False
+        return self.send_module_packet(packet)
 
-        Args:
-            msg_id: 消息ID（字节）
-            data: 数据部分（字节串）
-        """
+    def send_module_packet(self, message, context=None):
+        """发送已经校验/渲染完成的完整协议帧。"""
         if not self.module_connected or not self.module_serial:
             if getattr(self, 'download_perf', None):
                 self.is_downloading = False
@@ -6724,35 +7415,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, '提示', '模组串口未连接')
             return False
 
+        message = bytes(message)
+        msg_id = message[2]
+        function_key = context.get('function_key') if context else None
         try:
-            ota_perf = getattr(self, 'ota_perf', None) if msg_id == 0x44 else None
+            ota_perf = (getattr(self, 'ota_perf', None)
+                        if function_key == 'ota_packet' or (not context and msg_id == 0x44)
+                        else None)
             build_started = time.perf_counter() if ota_perf else None
-            # 构建消息
-            sync = b'\xEF\xAA'
-            msg_id_byte = bytes([msg_id])
-            data_size = len(data).to_bytes(2, byteorder='big')
-
-            # 计算校验和（不包括同步字段）
-            checksum = msg_id
-            checksum ^= data_size[0]
-            checksum ^= data_size[1]
-            for b in data:
-                checksum ^= b
-
-            # 完整消息
-            message = sync + msg_id_byte + data_size + data + bytes([checksum])
-
-            # # 打印调试信息（对OTA相关指令）
-            # if msg_id in [0x40, 0x43, 0x44, 0x51]:
-            #     hex_msg = ' '.join([f'{b:02X}' for b in message])
-            #     print(f'[发送指令] MID=0x{msg_id:02X}, 完整消息: {hex_msg}')
-
-            # 保留 flush，先测量它是否造成逐包等待
-            perf = getattr(self, 'download_perf', None) if msg_id == 0x18 else None
+            perf = (getattr(self, 'download_perf', None)
+                    if function_key == 'image_upload' or (not context and msg_id == 0x18)
+                    else None)
             perf = ota_perf or perf
-            write_started = time.perf_counter()
+            write_started = build_started if ota_perf else time.perf_counter()
             if ota_perf:
-                ota_perf.add('协议封装/校验', write_started - build_started)
+                ota_perf.add('协议封装/校验', 0.0)
             self.module_serial.write(message)
             written_at = time.perf_counter()
             self.module_serial.flush()
@@ -6761,32 +7438,32 @@ class MainWindow(QMainWindow):
                 perf.add('串口write', written_at - write_started)
                 perf.add('串口flush', flushed_at - written_at)
 
-            # 记录发送时间
             self.module_command_start_time[msg_id] = time.time()
+            self.current_command_type = function_key or msg_id
+            if context:
+                self.active_command_context = context
 
-            # 记录当前命令类型（用于Note消息识别）
-            self.current_command_type = msg_id
-
-            # 为关键指令启动超时重传定时器（0x14获取JPEG大小、0x15获取RAW大小、0x51设置波特率）
-            if msg_id in [0x14, 0x15, 0x51]:
-                # 停止之前的超时定时器
+            timeout_functions = {'get_jpeg_size', 'get_raw_size', 'set_baudrate'}
+            needs_timeout = (function_key in timeout_functions
+                             or (context is None and msg_id in [0x14, 0x15, 0x51]))
+            if needs_timeout:
                 if self.command_timeout_timer:
                     self.command_timeout_timer.stop()
-
-                # 记录待响应的指令
-                if not self.pending_command or self.pending_command[0] != msg_id:
-                    self.pending_command = (msg_id, data, 0)  # (msg_id, data, retry_count)
-
-                # 启动超时定时器（5秒超时）
+                current_pending = self.pending_command
+                same_command = (isinstance(current_pending, dict)
+                                and current_pending.get('packet') == message)
+                if not same_command:
+                    self.pending_command = {
+                        'msg_id': msg_id,
+                        'packet': message,
+                        'context': dict(context) if context else None,
+                        'function_key': function_key,
+                        'retry_count': 0,
+                    }
                 self.command_timeout_timer = QTimer()
                 self.command_timeout_timer.setSingleShot(True)
                 self.command_timeout_timer.timeout.connect(self.on_command_timeout)
                 self.command_timeout_timer.start(5000)
-
-            # 记录日志
-            # hex_str = ' '.join(f'{b:02X}' for b in message)
-            # self.append_module_log(f'[发送] {msg_id_byte}')
-
             return True
 
         except Exception as e:
@@ -6799,54 +7476,57 @@ class MainWindow(QMainWindow):
             return False
 
     def on_command_timeout(self):
-        """指令超时处理"""
+        """指令超时处理；重试完全相同的最终帧。"""
         if not self.pending_command:
             return
 
-        msg_id, data, retry_count = self.pending_command
+        pending = self.pending_command
+        # 兼容旧测试构造的元组。
+        if not isinstance(pending, dict):
+            msg_id, data, retry_count = pending
+            pending = {
+                'msg_id': msg_id,
+                'packet': protocol_defs.build_packet(msg_id, data),
+                'context': None,
+                'function_key': None,
+                'retry_count': retry_count,
+            }
+            self.pending_command = pending
 
-        # 最多重试3次
+        msg_id = pending['msg_id']
+        retry_count = pending['retry_count']
+        function_key = pending.get('function_key')
         if retry_count < 3:
             retry_count += 1
+            pending['retry_count'] = retry_count
             if getattr(self, 'download_perf', None):
                 self.download_perf.count(f'命令0x{msg_id:02X}超时重传')
             if getattr(self, 'ota_perf', None):
                 self.ota_perf.count(f'命令0x{msg_id:02X}超时重传')
-            self.pending_command = (msg_id, data, retry_count)
 
-            msg_name_map = {
-                0x14: '获取JPEG大小',
-                0x15: '获取RAW大小',
-                0x51: '设置波特率'
-            }
-            msg_name = msg_name_map.get(msg_id, f'0x{msg_id:02X}')
-
-            self.append_module_log(f'[超时重传] {msg_name}指令无响应，第{retry_count}次重试...', error=True)
-            print(f'[调试-超时] 指令0x{msg_id:02X}超时，重试次数={retry_count}')
-
-            # 重新发送指令
-            self.send_module_command(msg_id, data)
+            labels = {key: spec.label for key, spec in protocol_defs.FUNCTION_SPECS.items()}
+            msg_name = labels.get(function_key, f'0x{msg_id:02X}')
+            self.append_module_log(
+                f'[超时重传] {msg_name}指令无响应，第{retry_count}次重试...', error=True
+            )
+            context = pending.get('context')
+            if context:
+                context = dict(context)
+                context['is_retry'] = True
+            self.send_module_packet(pending['packet'], context)
         else:
-            # 重试次数用尽
-            msg_name_map = {
-                0x14: '获取JPEG大小',
-                0x15: '获取RAW大小',
-                0x51: '设置波特率'
-            }
-            msg_name = msg_name_map.get(msg_id, f'0x{msg_id:02X}')
-
-            self.append_module_log(f'[错误] {msg_name}指令重试3次后仍无响应，请检查模组连接', error=True)
+            labels = {key: spec.label for key, spec in protocol_defs.FUNCTION_SPECS.items()}
+            msg_name = labels.get(function_key, f'0x{msg_id:02X}')
+            self.append_module_log(
+                f'[错误] {msg_name}指令重试3次后仍无响应，请检查模组连接', error=True
+            )
             self.pending_command = None
-
             if getattr(self, 'download_perf', None):
                 self.is_downloading = False
                 self.end_download_performance('中止（命令超时重试耗尽）')
-
             if getattr(self, 'ota_perf', None):
                 self.finish_ota('中止（命令超时重试耗尽）')
-
-            # 清理下载状态
-            if msg_id in [0x14, 0x15]:
+            if function_key in ('get_jpeg_size', 'get_raw_size') or msg_id in [0x14, 0x15]:
                 self.is_downloading = False
                 self.download_buffer = bytearray()
                 self.download_offset = 0
@@ -6854,27 +7534,21 @@ class MainWindow(QMainWindow):
 
     def get_module_version(self):
         """获取模组版本号"""
-        # 发送0x30指令获取版本号
-        self.send_module_command(0x30)
-        self.append_module_log('[获取版本号] 已发送指令，等待响应...')
+        modality = self.current_operation_modality()
+        if self.send_protocol_command('get_version', modality):
+            self.append_module_log(
+                f'[{self.get_protocol_profile_name()}] 已发送获取版本号指令，等待响应...'
+            )
 
     def get_all_user_ids(self):
         """获取所有用户ID"""
-        # 根据模式选择发送不同的指令
-        if self.operation_mode_actions['palm'].isChecked():
-            # 手掌模式：根据项目模式选择命令
-            if self.project_mode_actions['KDS'].isChecked():
-                cmd = 0x84  # KDS模式
-                mode_name = 'KDS手掌模式'
-            else:
-                cmd = 0x64  # DSM模式
-                mode_name = 'DSM手掌模式'
-            self.send_module_command(cmd)
-            self.append_module_log(f'[{mode_name}] 已发送获取已注册用户列表指令，等待响应...')
-        else:
-            # 人脸模式：发送0x24指令获取所有用户ID
-            self.send_module_command(0x24)
-            self.append_module_log('[人脸模式] 已发送获取所有用户ID指令，等待响应...')
+        modality = self.current_operation_modality()
+        mode_name = '人脸' if modality == 'face' else '手掌'
+        if self.send_protocol_command('get_all_user_ids', modality):
+            self.append_module_log(
+                f'[{self.get_protocol_profile_name()} · {mode_name}] '
+                '已发送获取已注册用户列表指令，等待响应...'
+            )
 
     def register_single_frame(self):
         """单帧注册（支持重复执行）"""
@@ -6900,12 +7574,13 @@ class MainWindow(QMainWindow):
             self.repeat_reply_received = False  # 重置Reply接收标志
             self.append_module_log(f'[单帧注册] 第 {self.repeat_current}/{self.repeat_total} 次')
 
-        # 固定的注册用户信息（35字节）
-        user_data = b'\x00tester' + b'\x00' * 27 + b'\x05'  # "tester" + 27个0x00 + 0x05
-        self.send_module_command(0x1D, user_data)
+        if not self.send_protocol_command('register', 'face'):
+            return
 
         if not self.repeat_mode:
-            self.append_module_log('[单帧注册] 已发送注册指令，等待响应...')
+            self.append_module_log(
+                f'[{self.get_protocol_profile_name()} · 人脸注册] 已发送注册指令，等待响应...'
+            )
 
     def face_recognition(self):
         """人脸识别（支持重复执行）"""
@@ -6931,12 +7606,13 @@ class MainWindow(QMainWindow):
             self.repeat_reply_received = False  # 重置Reply接收标志
             self.append_module_log(f'[人脸识别] 第 {self.repeat_current}/{self.repeat_total} 次')
 
-        # 发送识别指令
-        data = b'\x00\x05'
-        self.send_module_command(0x12, data)
+        if not self.send_protocol_command('recognize', 'face'):
+            return
 
         if not self.repeat_mode:
-            self.append_module_log('[人脸识别] 已发送识别指令，等待响应...')
+            self.append_module_log(
+                f'[{self.get_protocol_profile_name()} · 人脸识别] 已发送识别指令，等待响应...'
+            )
 
     def palm_register(self):
         """手掌注册（支持重复执行）"""
@@ -6961,20 +7637,12 @@ class MainWindow(QMainWindow):
             self.repeat_current += 1
             self.repeat_reply_received = False  # 重置Reply接收标志
 
-        # 根据项目模式选择命令ID
-        if self.project_mode_actions['KDS'].isChecked():
-            cmd = 0x80  # KDS模式
-            mode_name = 'KDS手掌注册'
-        else:
-            cmd = 0x62  # DSM模式
-            mode_name = 'DSM手掌注册'
-
+        mode_name = f'{self.get_protocol_profile_name()} · 手掌注册'
         if self.repeat_mode:
             self.append_module_log(f'[{mode_name}] 第 {self.repeat_current}/{self.repeat_total} 次')
 
-        # 发送手掌注册指令
-        user_data = b'\x00tester' + b'\x00' * 27 + b'\x05'
-        self.send_module_command(cmd, user_data)
+        if not self.send_protocol_command('register', 'palm'):
+            return
 
         if not self.repeat_mode:
             self.append_module_log(f'[{mode_name}] 已发送注册指令，等待响应...')
@@ -7002,20 +7670,12 @@ class MainWindow(QMainWindow):
             self.repeat_current += 1
             self.repeat_reply_received = False  # 重置Reply接收标志
 
-        # 根据项目模式选择命令ID
-        if self.project_mode_actions['KDS'].isChecked():
-            cmd = 0x81  # KDS模式
-            mode_name = 'KDS手掌识别'
-        else:
-            cmd = 0x63  # DSM模式
-            mode_name = 'DSM手掌识别'
-
+        mode_name = f'{self.get_protocol_profile_name()} · 手掌识别'
         if self.repeat_mode:
             self.append_module_log(f'[{mode_name}] 第 {self.repeat_current}/{self.repeat_total} 次')
 
-        # 发送手掌识别指令
-        data = b'\x00\x05'
-        self.send_module_command(cmd, data)
+        if not self.send_protocol_command('recognize', 'palm'):
+            return
 
         if not self.repeat_mode:
             self.append_module_log(f'[{mode_name}] 已发送识别指令，等待响应...')
@@ -7039,24 +7699,14 @@ class MainWindow(QMainWindow):
         if not ok:
             return
 
-        # 根据模式选择发送不同的指令
-        if self.operation_mode_actions['palm'].isChecked():
-            # 手掌模式：根据项目模式选择命令
-            if self.project_mode_actions['KDS'].isChecked():
-                cmd = 0x83  # KDS模式
-                mode_name = 'KDS手掌模式'
-            else:
-                cmd = 0x65  # DSM模式
-                mode_name = 'DSM手掌模式'
-        else:
-            # 人脸模式：发送0x20指令删除指定ID
-            cmd = 0x20
-            mode_name = '人脸模式'
-
-        # 用户ID转为2字节大端序
-        data = user_id.to_bytes(2, byteorder='big')
-        self.send_module_command(cmd, data)
-        self.append_module_log(f'[{mode_name}] 已发送删除用户ID {user_id} 的指令，等待响应...')
+        modality = self.current_operation_modality()
+        mode_name = '人脸' if modality == 'face' else '手掌'
+        if self.send_protocol_command(
+                'delete_user', modality, {'USER_ID': user_id}):
+            self.append_module_log(
+                f'[{self.get_protocol_profile_name()} · {mode_name}] '
+                f'已发送删除用户ID {user_id} 的指令，等待响应...'
+            )
 
     def delete_all_users(self):
         """删除所有用户"""
@@ -7074,23 +7724,13 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        # 根据模式选择发送不同的指令
-        if self.operation_mode_actions['palm'].isChecked():
-            # 手掌模式：根据项目模式选择命令
-            if self.project_mode_actions['KDS'].isChecked():
-                cmd = 0x82  # KDS模式
-                mode_name = 'KDS手掌模式'
-            else:
-                cmd = 0x66  # DSM模式
-                mode_name = 'DSM手掌模式'
-        else:
-            # 人脸模式：发送0x21指令删除所有用户
-            cmd = 0x21
-            mode_name = '人脸模式'
-
-        # 删除所有用户没有数据部分
-        self.send_module_command(cmd)
-        self.append_module_log(f'[{mode_name}] 已发送删除所有用户的指令，等待响应...')
+        modality = self.current_operation_modality()
+        mode_name = '人脸' if modality == 'face' else '手掌'
+        if self.send_protocol_command('delete_all', modality):
+            self.append_module_log(
+                f'[{self.get_protocol_profile_name()} · {mode_name}] '
+                '已发送删除所有用户的指令，等待响应...'
+            )
 
     def restart_module(self):
         """重启模组"""
@@ -7108,9 +7748,9 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        # 发送重启指令：0x55
-        self.send_module_command(0x55)
-        self.append_module_log('[重启模组] 已发送重启指令，等待响应...')
+        modality = self.current_operation_modality()
+        if self.send_protocol_command('restart', modality):
+            self.append_module_log('[重启模组] 已发送重启指令，等待响应...')
 
     def standby_module(self):
         """待机模组"""
@@ -7131,7 +7771,7 @@ class MainWindow(QMainWindow):
                 # 设置待机恢复标志
                 self.is_standby_restoring = True
                 # 发送0x51指令设置波特率为115200
-                self.send_module_command(0x51, b'\x01')  # 0x01 = 115200
+                self.send_protocol_command('set_baudrate', runtime_values={'BAUD_CODE': 0x01})
                 # 立即停止所有下载操作
                 self.end_download_performance('中止（进入待机）')
                 self.is_downloading = False
@@ -7164,46 +7804,38 @@ class MainWindow(QMainWindow):
 
     def _send_standby_command(self):
         """延迟发送待机指令"""
-        self.send_module_command(0x10)
-        self.append_module_log('[待机] 已发送待机指令，等待响应...')
+        if self.send_protocol_command('standby'):
+            self.append_module_log('[待机] 已发送待机指令，等待响应...')
 
     def enter_demo_mode(self):
         """进入演示模式"""
-        # 发送进入演示指令：0xFE, data=0x01
-        self.send_module_command(0xFE, b'\x01')
-        self.append_module_log('[演示模式] 已发送进入演示模式指令，等待响应...')
+        if self.send_protocol_command('enter_demo'):
+            self.append_module_log('[演示模式] 已发送进入演示模式指令，等待响应...')
 
     def exit_demo_mode(self):
         """退出演示模式"""
-        # 发送退出演示指令：0xFE, data=0x00
-        self.send_module_command(0xFE, b'\x00')
-        self.append_module_log('[演示模式] 已发送退出演示模式指令，等待响应...')
+        if self.send_protocol_command('exit_demo'):
+            self.append_module_log('[演示模式] 已发送退出演示模式指令，等待响应...')
 
     def enter_debug_mode(self):
         """进入Debug模式"""
-        # 发送进入Debug指令：0xF0, data=0x01
-        self.send_module_command(0xF0, b'\x01')
-        self.append_module_log('[Debug模式] 已发送进入Debug模式指令，等待响应...')
+        if self.send_protocol_command('enter_debug'):
+            self.append_module_log('[Debug模式] 已发送进入Debug模式指令，等待响应...')
 
     def exit_debug_mode(self):
         """退出Debug模式"""
-        # 发送退出Debug指令：0xF0, data=0x00
-        self.send_module_command(0xF0, b'\x00')
-        self.append_module_log('[Debug模式] 已发送退出Debug模式指令，等待响应...')
+        if self.send_protocol_command('exit_debug'):
+            self.append_module_log('[Debug模式] 已发送退出Debug模式指令，等待响应...')
 
     def send_get_image_size_command(self):
         """发送获取图片大小指令（在波特率切换后延迟调用）"""
         # 步骤2: 根据下载类型发送获取图片大小指令
         if self.download_type == 'raw':
             self.append_module_log('发送获取RAW图大小指令')
-            print(f'[调试-0x51] 准备发送0x15指令')
-            self.send_module_command(0x15)
-            print(f'[调试-0x51] 已发送0x15指令')
+            self.send_protocol_command('get_raw_size')
         else:  # jpeg
             self.append_module_log('发送获取JPEG大小指令')
-            print(f'[调试-0x51] 准备发送0x14指令')
-            self.send_module_command(0x14)
-            print(f'[调试-0x51] 已发送0x14指令')
+            self.send_protocol_command('get_jpeg_size')
 
     def set_download_polling(self, active):
         timer = getattr(self, 'module_response_timer', None)
@@ -7222,6 +7854,16 @@ class MainWindow(QMainWindow):
             self.retry_timer.stop()
         perf = getattr(self, 'download_perf', None)
         self.download_perf = None
+        if not getattr(self, 'ota_in_progress', False) \
+                and not getattr(self, 'repeat_mode', False) \
+                and not getattr(self, 'sequence_running', False):
+            self.protocol_task_profile_id = None
+        contexts = getattr(self, 'command_contexts', None)
+        if contexts:
+            for function_key in ('set_baudrate', 'get_jpeg_size', 'get_raw_size',
+                                 'image_upload'):
+                while self._take_function_context(function_key):
+                    pass
         if perf:
             self.is_downloading = False
             if self.command_timeout_timer:
@@ -7254,7 +7896,7 @@ class MainWindow(QMainWindow):
 
         # 步骤1: 设置高速波特率 1500000
         self.append_module_log('设置波特率为 1500000')
-        self.send_module_command(0x51, b'\x04')  # 0x04 = 1500000
+        self.send_protocol_command('set_baudrate', runtime_values={'BAUD_CODE': 0x04})
 
     def download_raw_image(self):
         """下载RAW图片（完整流程）"""
@@ -7280,7 +7922,7 @@ class MainWindow(QMainWindow):
 
         # 步骤1: 设置高速波特率 1500000
         self.append_module_log('设置波特率为 1500000')
-        self.send_module_command(0x51, b'\x04')  # 0x04 = 1500000
+        self.send_protocol_command('set_baudrate', runtime_values={'BAUD_CODE': 0x04})
 
     def start_image_download(self):
         """开始图片下载传输"""
@@ -7325,7 +7967,8 @@ class MainWindow(QMainWindow):
                 perf.handled_at = None
             perf.request_started = now
 
-        if not self.send_module_command(0x18, data):
+        if not self.send_protocol_command(
+                'image_upload', runtime_values={'OFFSET': offset, 'SIZE': size}):
             return
 
         # 停止之前的重传定时器
@@ -7529,7 +8172,7 @@ class MainWindow(QMainWindow):
             self.download_buffer = bytearray()
             # 注意：不要重置download_offset和download_total_size，用于判断是恢复波特率
 
-            self.send_module_command(0x51, b'\x01')  # 0x01 = 115200
+            self.send_protocol_command('set_baudrate', runtime_values={'BAUD_CODE': 0x01})
             if getattr(self, 'download_perf', None):
                 self.download_perf.mark('restore_sent')
 
@@ -7639,6 +8282,9 @@ class MainWindow(QMainWindow):
             self.sequence_wait_response = None
             self.btn_start_sequence.setEnabled(True)
             self.btn_stop_sequence.setEnabled(False)
+            if not self.repeat_mode and not self.is_downloading \
+                    and not getattr(self, 'ota_in_progress', False):
+                self.protocol_task_profile_id = None
             self.append_module_log(f'[序列] 已停止执行序列（已完成 {self.sequence_current_loop - 1}/{self.sequence_total_loops} 次循环）', error=True)
 
     def execute_next_sequence_step(self):
@@ -7661,6 +8307,9 @@ class MainWindow(QMainWindow):
                 self.sequence_running = False
                 self.btn_start_sequence.setEnabled(True)
                 self.btn_stop_sequence.setEnabled(False)
+                if not self.repeat_mode and not self.is_downloading \
+                        and not getattr(self, 'ota_in_progress', False):
+                    self.protocol_task_profile_id = None
                 self.append_module_log(f'[序列] 序列执行完成，共完成 {self.sequence_total_loops} 轮循环', success=True)
                 return
 
@@ -7737,6 +8386,10 @@ class MainWindow(QMainWindow):
     def finish_ota(self, outcome):
         self.ota_in_progress = False
         self.ota_stage = 0
+        if not getattr(self, 'is_downloading', False) \
+                and not getattr(self, 'repeat_mode', False) \
+                and not getattr(self, 'sequence_running', False):
+            self.protocol_task_profile_id = None
         self.ota_waiting_ack = False
         for name in ('ota_step_timer', 'ota_retry_timer'):
             timer = getattr(self, name, None)
@@ -7744,11 +8397,25 @@ class MainWindow(QMainWindow):
                 timer.stop()
                 timer.deleteLater()
                 setattr(self, name, None)
-        if self.pending_command and self.pending_command[0] in (0x51, 0x40, 0x43, 0x44):
+        pending_function = None
+        pending_mid = None
+        if self.pending_command:
+            if isinstance(self.pending_command, dict):
+                pending_function = self.pending_command.get('function_key')
+                pending_mid = self.pending_command.get('msg_id')
+            else:
+                pending_mid = self.pending_command[0]
+        if pending_function in ('set_baudrate', 'ota_enter', 'ota_header', 'ota_packet') \
+                or pending_mid in (0x51, 0x40, 0x43, 0x44):
             if self.command_timeout_timer:
                 self.command_timeout_timer.stop()
             self.pending_command = None
         self.set_download_polling(self.is_downloading)
+        contexts = getattr(self, 'command_contexts', None)
+        if contexts:
+            for function_key in ('set_baudrate', 'ota_enter', 'ota_header', 'ota_packet'):
+                while self._take_function_context(function_key):
+                    pass
         perf = getattr(self, 'ota_perf', None)
         self.ota_perf = None
         if perf and outcome.startswith('中止'):
@@ -7901,7 +8568,8 @@ class MainWindow(QMainWindow):
             self.ota_retry_count = 0
             self.ota_waiting_ack = False
             print(f'[OTA调试] 发送0x51指令，波特率代码: 0x{baudrate_code:02X}, 目标波特率: {baudrate_value}')
-            if not self.send_module_command(0x51, bytes([baudrate_code])):
+            if not self.send_protocol_command(
+                    'set_baudrate', runtime_values={'BAUD_CODE': baudrate_code}):
                 self.finish_ota('中止（波特率指令发送失败）')
 
         except Exception as e:
@@ -7929,7 +8597,7 @@ class MainWindow(QMainWindow):
         self.append_module_log('[OTA] 步骤2: 进入OTA状态')
         # 发送0x40指令进入OTA状态
         print(f'[OTA调试] 发送0x40指令: EF AA 40 00 00 40')
-        if not self.send_module_command(0x40):
+        if not self.send_protocol_command('ota_enter'):
             self.finish_ota('中止（进入OTA指令发送失败）')
 
     def send_ota_header(self):
@@ -7980,8 +8648,12 @@ class MainWindow(QMainWindow):
             print(f'[OTA调试] 完整header数据(42字节): {hex_data}')
             print(f'[OTA调试] Header数据长度: {len(data)}字节')
 
-            # 发送0x43指令
-            if not self.send_module_command(0x43, data):
+            if not self.send_protocol_command('ota_header', runtime_values={
+                    'FILE_SIZE': file_size,
+                    'PACKET_COUNT': packet_count,
+                    'PACKET_SIZE': packet_size,
+                    'MD5_ASCII': md5_bytes,
+            }):
                 self.finish_ota('中止（header发送失败）')
 
         except Exception as e:
@@ -8024,7 +8696,11 @@ class MainWindow(QMainWindow):
                 perf.request_started = time.perf_counter()
             self.ota_waiting_ack = True
             # 发送失败后不启动本包超时重传
-            if not self.send_module_command(0x44, data):
+            if not self.send_protocol_command('ota_packet', runtime_values={
+                    'PACKET_INDEX': self.ota_current_packet,
+                    'PACKET_LENGTH': current_packet_size,
+                    'FIRMWARE_DATA': packet_data,
+            }):
                 self.finish_ota('中止（固件包发送失败）')
                 return
 
@@ -8089,8 +8765,8 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName('capLG')
-    app.setApplicationVersion('1.0.0.8')
-    icon_name = 'ChatGPT Image 2026年9月16日 00_28_09.png'
+    app.setApplicationVersion('1.0.1.0')
+    icon_name = 'AppIcon.png'
     if getattr(sys, 'frozen', False):
         icon_path = os.path.join(sys._MEIPASS, 'resources', icon_name)
     else:

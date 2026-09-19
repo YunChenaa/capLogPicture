@@ -1,0 +1,10 @@
+<RCC>
+    <qresource prefix="/theme">
+        <file alias="down.svg">theme_icons/down.svg</file>
+        <file alias="up.svg">theme_icons/up.svg</file>
+        <file alias="down_disabled.svg">theme_icons/down_disabled.svg</file>
+        <file alias="up_disabled.svg">theme_icons/up_disabled.svg</file>
+        <file alias="refresh_dark.svg">theme_icons/refresh_dark.svg</file>
+        <file alias="refresh_light.svg">theme_icons/refresh_light.svg</file>
+    </qresource>
+</RCC>
