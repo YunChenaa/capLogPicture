@@ -52,10 +52,24 @@ import protocol_profiles as protocol_defs
 # ==============================
 
 ANSI_ESCAPE_PATTERN = re.compile(r'\x1b\[[0-9;]*m')
+LOG_LINE_TIMESTAMP_PATTERN = re.compile(
+    r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\]'
+)
 
 def strip_ansi_codes(text):
     """移除文本中的 ANSI 转义序列（颜色代码等）"""
     return ANSI_ESCAPE_PATTERN.sub('', text)
+
+
+def log_line_datetime(line_text):
+    """读取采集日志行首时间；没有标准时间戳时返回None。"""
+    match = LOG_LINE_TIMESTAMP_PATTERN.match(line_text or '')
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S.%f')
+    except ValueError:
+        return None
 
 # ==============================
 # 全局日志缓存
@@ -130,6 +144,17 @@ class LogMarker:
     log_index: int
     log_count: int
     line_text: str
+    marked_at: datetime = None
+
+    @property
+    def log_time(self):
+        """目标日志行自身的采集时间。"""
+        return log_line_datetime(self.line_text) or self.created_at
+
+    @property
+    def action_time(self):
+        """用户实际执行打点操作的时间。"""
+        return self.marked_at or self.created_at
 
     @property
     def summary(self):
@@ -204,7 +229,7 @@ def format_marker_section(markers, start_index=0, start_marker_id=None):
         relative_line = marker.log_index - start_index + 1
         lines.extend((
             f'名称: {marker.name}',
-            f'打点时间: {marker.created_at.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}',
+            f'日志时间: {marker.log_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}',
             f'原始日志行号: {marker.line_number}',
             f'保存文件相对行号: {relative_line}',
             f'打点时日志总行数: {marker.log_count}',
@@ -220,6 +245,37 @@ def build_marked_log_text(logs, markers, start_index=0, start_marker_id=None):
     if body:
         body += '\n'
     return body + format_marker_section(markers, start_index, start_marker_id)
+
+
+def build_selected_log_text(logs, markers, start_index=0, end_index=None):
+    """构建任意连续日志范围，并追加落在该范围内的打点信息。"""
+    if end_index is None:
+        end_index = len(logs)
+    start_index = max(0, min(start_index, len(logs)))
+    end_index = max(start_index, min(end_index, len(logs)))
+    selected_logs = logs[start_index:end_index]
+    body = '\n'.join(selected_logs)
+    if body:
+        body += '\n'
+    selected_markers = [
+        marker for marker in markers
+        if start_index <= marker.log_index < end_index
+    ]
+    if not selected_markers:
+        return body
+    lines = ['', '========== 打点记录 ==========']
+    for marker in selected_markers:
+        relative_line = marker.log_index - start_index + 1
+        lines.extend((
+            f'名称: {marker.name}',
+            f'日志时间: {marker.log_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}',
+            f'原始日志行号: {marker.line_number}',
+            f'保存文件相对行号: {relative_line}',
+            f'打点时日志总行数: {marker.log_count}',
+            f'日志摘要: {marker.summary}',
+            '------------------------------',
+        ))
+    return body + '\n'.join(lines) + '\n'
 
 
 def _windows_command_line_to_argv(command):
@@ -1722,12 +1778,12 @@ class CustomCommandDialog(QDialog):
             hex_str = ' '.join([f'{b:02X}' for b in command_bytes])
             self.append_log(f'[发送] {hex_str} ({len(command_bytes)} 字节)', send=True)
 
-            # 发送命令
+            # 原样发送完整帧，并登记为“仅观察”的自定义命令上下文。
             if self.parent_window.module_serial and self.parent_window.module_serial.is_open:
-                self.parent_window.module_serial.write(command_bytes)
-
-                # 也记录到主窗口日志
-                self.parent_window.append_module_log(f'[自定义命令] 发送: {hex_str}')
+                if self.parent_window.send_custom_raw_packet(command_bytes):
+                    self.parent_window.append_module_log(f'[自定义命令] 发送: {hex_str}')
+                else:
+                    self.append_log('[错误] 发送失败', error=True)
             else:
                 self.append_log('[错误] 串口未打开', error=True)
 
@@ -2085,7 +2141,7 @@ class LogMarkerWindow(QDialog):
                 self.table.insertRow(row)
                 values = (
                     marker.name,
-                    marker.created_at.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                    marker.log_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
                     str(marker.log_count),
                     str(marker.line_number),
                     marker.summary,
@@ -2154,7 +2210,7 @@ class SaveLogDialog(QDialog):
         self.range_combo = QComboBox()
         self.range_combo.addItem('全部日志', None)
         for marker in markers:
-            label = (f'{marker.name} · {marker.created_at.strftime("%H:%M:%S.%f")[:-3]} '
+            label = (f'{marker.name} · {marker.log_time.strftime("%H:%M:%S.%f")[:-3]} '
                      f'· 第{marker.line_number}行')
             self.range_combo.addItem(label, marker.marker_id)
         range_layout.addWidget(self.range_combo, 1)
@@ -2372,6 +2428,9 @@ class MainWindow(QMainWindow):
         self.ota_perf = None
         self.ota_step_timer = None
         self.ota_waiting_ack = False
+        self.ota_set_baudrate = True
+        self.ota_original_baudrate = 115200
+        self.ota_target_baudrate = 1500000
 
         # 待机相关
         self.is_standby_restoring = False  # 是否正在待机恢复波特率
@@ -3489,6 +3548,13 @@ class MainWindow(QMainWindow):
                              ('Y+IR', 'Y+IR（50% + 50%）')), 'Y+IR'
             )
         self.setup_protocol_profiles_menu()
+        _, self.ota_baudrate_mode_group, self.ota_baudrate_mode_actions = \
+            self._add_exclusive_mode_menu(
+                'OTA 波特率', (('set', '设置波特率'), ('keep', '不设置波特率')), 'set'
+            )
+        self.ota_baudrate_mode_group.triggered.connect(
+            self.on_ota_baudrate_mode_selected
+        )
         _, self.stop_condition_group, self.stop_condition_actions = \
             self._add_exclusive_mode_menu(
                 '停止条件', (('none', '不停止'), ('fail', '失败停止'),
@@ -3603,6 +3669,15 @@ class MainWindow(QMainWindow):
     def current_operation_modality(self):
         return 'face' if self.operation_mode_actions['face'].isChecked() else 'palm'
 
+    def on_ota_baudrate_mode_selected(self, action):
+        """OTA运行中不允许改变已锁定的波特率策略。"""
+        if not getattr(self, 'ota_in_progress', False):
+            return
+        locked_key = 'set' if self.ota_set_baudrate else 'keep'
+        self.ota_baudrate_mode_actions[locked_key].setChecked(True)
+        QMessageBox.warning(self, 'OTA波特率', 'OTA正在运行，暂时不能切换波特率策略。')
+        self.update_module_mode_summary()
+
     def update_module_mode_summary(self, checked=None):
         """同步模式按钮摘要和提示。"""
         operation = '人脸' if self.current_operation_modality() == 'face' else '手掌'
@@ -3610,9 +3685,13 @@ class MainWindow(QMainWindow):
         profile = protocol_defs.profile_name(
             self.active_protocol_profile_id, self.protocol_profiles
         )
+        ota_baudrate = ('OTA设置波特率'
+                        if self.ota_baudrate_mode_actions['set'].isChecked()
+                        else 'OTA不设置波特率')
         stop_names = {'none': '不停止', 'fail': '失败停止', 'success': '成功停止'}
         stop = stop_names[self._checked_action_key(self.stop_condition_actions)]
-        summary = f'{operation} · {raw} · {profile} · {stop} · {self.repeat_count_spin.value()}次'
+        summary = (f'{operation} · {raw} · {profile} · {ota_baudrate} · '
+                   f'{stop} · {self.repeat_count_spin.value()}次')
         self.btn_module_modes.setToolTip(summary)
         self.btn_module_modes.setAccessibleDescription(summary)
 
@@ -4368,13 +4447,15 @@ class MainWindow(QMainWindow):
             log_count = len(full_log_cache)
             line_text = full_log_cache[log_index]
         marker_id = self.next_log_marker_id
+        marked_at = datetime.now()
         marker = LogMarker(
             marker_id=marker_id,
             name=f'记录{marker_id}',
-            created_at=datetime.now(),
+            created_at=log_line_datetime(line_text) or marked_at,
             log_index=log_index,
             log_count=log_count,
             line_text=line_text,
+            marked_at=marked_at,
         )
         self.next_log_marker_id += 1
         self.log_markers.append(marker)
@@ -5157,26 +5238,38 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, '错误', f'复制文件失败:\n{e}')
             return
 
-        # 保存日志
-        if full_log_cache:
+        # 保存日志，并与“更多功能 → 保存日志”一致追加适用打点信息。
+        with log_cache_lock:
+            logs_snapshot = list(full_log_cache)
+        if logs_snapshot:
             strategy_index = self.strategy_combo.currentIndex()
+            start_index = 0
+            end_index = len(logs_snapshot)
 
-            if strategy_index == 0:  # 全部日志
-                logs_to_save = extract_logs('all')
-            elif strategy_index == 1:  # 最近N行
-                logs_to_save = extract_logs('recent_n', self.lines_spin.value())
-            else:  # 从关键词开始
+            if strategy_index == 1:  # 最近N行
+                start_index = max(0, end_index - self.lines_spin.value())
+            elif strategy_index == 2:  # 从关键词开始
                 keyword = self.keyword_entry.text().strip()
                 if not keyword:
                     QMessageBox.warning(self, '提示', '请输入关键词')
                     return
-                logs_to_save = extract_logs('from_keyword', keyword)
+                start_index = next(
+                    (index for index in range(end_index - 1, -1, -1)
+                     if keyword in logs_snapshot[index]),
+                    end_index,
+                )
 
-            if logs_to_save:
+            log_text = build_selected_log_text(
+                logs_snapshot, list(self.log_markers), start_index, end_index
+            )
+            if log_text:
                 log_file = os.path.join(dst_folder, 'log.txt')
-                with open(log_file, 'w', encoding='utf-8') as f:
-                    for line in logs_to_save:
-                        f.write(line + "\n")
+                try:
+                    with open(log_file, 'w', encoding='utf-8', newline='') as stream:
+                        stream.write(log_text)
+                except OSError as error:
+                    QMessageBox.critical(self, '保存失败', f'写入日志失败：\n{error}')
+                    return
 
         # 保存测试数据记录
         _save_last_selection({
@@ -6068,6 +6161,7 @@ class MainWindow(QMainWindow):
 
             # 重置下载相关标志位（防止下载卡死后重新连接无法下载）
             if getattr(self, 'ota_in_progress', False) or getattr(self, 'ota_perf', None):
+                # 物理断开后不可发送任何恢复指令，直接清理OTA状态。
                 self.finish_ota('中止（断开模组）')
             self.end_download_performance('中止（断开模组）')
             self.is_downloading = False
@@ -6215,8 +6309,23 @@ class MainWindow(QMainWindow):
                     if ((function_key == 'ota_packet' or (not context and msg_id == 0x44))
                             and len(response) > 4 and getattr(self, 'ota_perf', None)):
                         self.record_ota_ack_timing(response[4])
+                    if function_key == 'set_baudrate' and getattr(self, 'ota_in_progress', False):
+                        payload_hex = payload.hex(' ').upper() if payload else '空'
+                        serial_baudrate = getattr(self.module_serial, 'baudrate', '未知')
+                        # self.append_module_log(
+                        #     f'[OTA诊断] 收到设置波特率回复: MID=0x{msg_id:02X}, '
+                        #     f'result=0x{result:02X}, payload长度={len(payload)}, '
+                        #     f'payload={payload_hex}, 本机波特率={serial_baudrate}, '
+                        #     f'OTA阶段={self.ota_stage}, 上下文序号={context.get("sequence") if context else "无"}'
+                        # )
+                    elif msg_id == 0x51 and not context:
+                        pass
+                        # self.append_module_log(
+                        #     f'[OTA诊断] 收到未关联的0x51回复: result=0x{result:02X}, '
+                        #     f'payload={payload.hex(" ").upper() if payload else "空"}'
+                        # )
                     canonical_id = msg_id
-                    if context:
+                    if context and function_key != 'custom_raw':
                         canonical_id = protocol_defs.canonical_response_mid(
                             function_key, context['profile_id'], context['modality']
                         )
@@ -6280,9 +6389,6 @@ class MainWindow(QMainWindow):
             self.is_downloading = False
             self.end_download_performance(f'中止（{msg_id} 返回失败）')
 
-        if (function_key == 'set_baudrate' or (not command_context and msg_id == '0x51')) \
-                and result != 0x00 and getattr(self, 'ota_perf', None):
-            self.finish_ota('中止（设置波特率失败）')
         if function_key in ('ota_enter', 'ota_header') or (not command_context and msg_id in ('0x40', '0x43')):
             stage_function = function_key
             if stage_function is None:
@@ -6297,6 +6403,29 @@ class MainWindow(QMainWindow):
             self.module_command_start_time.pop(command_context['msg_id'], None)
         else:
             elapsed_time = self.get_command_elapsed_time(msg_id)
+
+        if function_key == 'custom_raw':
+            payload_text = ' '.join(f'{value:02X}' for value in payload) or '无'
+            self.append_module_log(
+                f'[自定义命令] 回复 MID={msg_id}，结果码=0x{result:02X}，'
+                f'payload={payload_text} {elapsed_time}',
+                success=(result == 0x00), error=(result != 0x00)
+            )
+            target_baudrate = command_context.get('custom_baudrate_target')
+            if result == 0x00 and target_baudrate and self.module_serial:
+                try:
+                    previous_baudrate = self.module_serial.baudrate
+                    self.module_serial.baudrate = target_baudrate
+                    self.append_module_log(
+                        f'[自定义命令] 本机串口波特率已从 {previous_baudrate} '
+                        f'切换到 {target_baudrate}', success=True
+                    )
+                except Exception as error:
+                    self.append_module_log(
+                        f'[自定义命令] 本机串口切换到 {target_baudrate} 失败: {error}',
+                        error=True
+                    )
+            return
 
         if function_key == 'get_version' or (not command_context and msg_id == '0x30'):  # 获取版本号
             if result == 0x00:
@@ -6430,143 +6559,96 @@ class MainWindow(QMainWindow):
                 # 识别失败也触发序列下一步
                 self.check_sequence_next('识别D')
 
-        elif function_key == 'set_baudrate' or (not command_context and msg_id == '0x51'):  # 设置波特率
-            # 添加调试信息
-            print(f'[调试-0x51] result=0x{result:02X}, payload长度={len(payload)}, payload={payload.hex().upper() if payload else "空"}')
-
-            if result == 0x00:
-                # 设置成功，payload第一个字节是波特率代码
-                baudrate_map = {
-                    0x01: 115200,
-                    0x02: 230400,
-                    0x03: 460800,
-                    0x04: 1500000,
-                }
-
-                # 根据你的描述，data部分的第二个字节是结果，那么payload应该是result之后的数据
-                # 但可能payload为空，我们需要从发送的命令中获取波特率代码
-                if len(payload) >= 1:
-                    baudrate_code = payload[0]
-                    print(f'[调试-0x51] 从payload读取波特率代码: 0x{baudrate_code:02X}')
-                elif command_context:
-                    # 自定义完整帧可能改变固定data布局；目标波特率优先取流程状态，
-                    # 常规下载则根据当前阶段判断高速/恢复。
-                    if self.ota_in_progress:
-                        baudrate_code = {
-                            115200: 0x01, 230400: 0x02,
-                            460800: 0x03, 1500000: 0x04,
-                        }.get(getattr(self, 'ota_target_baudrate', 1500000), 0x04)
-                    elif getattr(self, 'is_standby_restoring', False):
-                        baudrate_code = 0x01
-                    elif self.download_offset >= self.download_total_size and self.download_total_size > 0:
-                        baudrate_code = 0x01
+        elif function_key == 'set_baudrate':  # 业务流程发起的设置波特率
+            payload_hex = payload.hex(' ').upper() if payload else '空'
+            # self.append_module_log(
+            #     f'[OTA诊断] 处理设置波特率回复: result=0x{result:02X}, '
+            #     f'payload长度={len(payload)}, payload={payload_hex}, '
+            #     f'OTA阶段={self.ota_stage}, 目标波特率={getattr(self, "ota_target_baudrate", "未知")}, '
+            #     f'上下文存在={command_context is not None}'
+            # )
+            if result != 0x00:
+                self.append_module_log(
+                    f'设置波特率失败（result=0x{result:02X}, payload={payload_hex}） '
+                    f'{elapsed_time}', error=True
+                )
+                if getattr(self, 'ota_in_progress', False):
+                    if self.ota_stage == 7:
+                        self.append_module_log('[OTA] 恢复原波特率失败，OTA主体已完成', error=True)
+                        self.finish_ota('升级完成（恢复波特率失败）')
                     else:
-                        baudrate_code = 0x04
-                else:
-                    # payload为空，从当前下载状态推断
-                    print(f'[调试-0x51] payload为空，从下载状态推断')
-                    print(f'[调试-0x51] is_downloading={self.is_downloading}, download_offset={self.download_offset}, download_total_size={self.download_total_size}')
-                    baudrate_code = None
+                        self.finish_ota('中止（设置波特率失败）')
+                return
 
-                    # 如果已经完成下载（download_offset >= download_total_size），说明是恢复波特率
-                    if self.download_offset >= self.download_total_size and self.download_total_size > 0:
-                        baudrate_code = 0x01
-                        print(f'[调试-0x51] 下载已完成，推断为恢复标准波特率: 0x01')
-                    # 如果还没开始下载，应该是设置高速波特率
-                    elif self.download_offset == 0 and self.download_total_size == 0:
-                        baudrate_code = 0x04
-                        print(f'[调试-0x51] 尚未开始下载，推断为高速波特率设置: 0x04')
-                    else:
-                        # 其他情况，根据is_downloading判断
-                        if self.is_downloading or self.download_offset > 0:
-                            baudrate_code = 0x01
-                            print(f'[调试-0x51] 正在下载或下载中断，推断为恢复标准波特率: 0x01')
-                        else:
-                            baudrate_code = 0x04
-                            print(f'[调试-0x51] 默认推断为高速波特率设置: 0x04')
+            self.append_module_log(f'设置波特率成功！{elapsed_time}', success=True)
+            download_perf = getattr(self, 'download_perf', None)
+            download_preparing = (
+                download_perf is not None and self.download_type in ('jpeg', 'raw')
+            )
 
-                if baudrate_code is not None:
-                    baudrate = baudrate_map.get(baudrate_code, baudrate_code)
-                    self.append_module_log(f'设置波特率成功！{elapsed_time}', success=True)
-                    print(f'[调试-0x51] 推断波特率: {baudrate}')
-                    print(f'[调试-0x51] ota_in_progress={self.ota_in_progress}, ota_stage={self.ota_stage}')
-                    print(f'[调试-0x51] is_standby_restoring={getattr(self, "is_standby_restoring", False)}')
-
-                    # 判断是OTA升级还是图片下载
-                    if self.ota_in_progress and self.ota_stage == 1:
-                        # OTA升级流程：使用保存的目标波特率，而不是推断的波特率
-                        actual_baudrate = getattr(self, 'ota_target_baudrate', baudrate)
-                        print(f'[调试-0x51] OTA升级流程，切换波特率到 {actual_baudrate}（目标波特率）')
-                        if self.module_serial:
-                            try:
-                                self.module_serial.baudrate = actual_baudrate
-                                self.append_module_log(f'[OTA] 串口波特率已切换到 {actual_baudrate}')
-                                # 进入下一阶段：发送0x40进入OTA状态
-                                self.ota_stage = 2
-                                self.schedule_ota_step(100, 2, self.enter_ota_mode)
-                            except Exception as e:
-                                self.append_module_log(f'[OTA] 切换波特率失败: {e}', error=True)
-                                self.finish_ota('中止（切换波特率失败）')
-                    elif self.ota_in_progress and self.ota_stage > 1:
-                        # OTA升级过程中（stage > 1），忽略其他0x51响应
-                        print(f'[调试-0x51] OTA升级过程中，忽略0x51响应（stage={self.ota_stage}）')
-                    elif getattr(self, 'is_standby_restoring', False):
-                        # 待机恢复波特率，不触发任何操作
-                        print(f'[调试-0x51] 待机恢复波特率，不触发图片下载')
-                        self.is_standby_restoring = False
-                    elif baudrate == 1500000 and self.module_serial:
-                        # 图片下载流程
-                        print(f'[调试-0x51] 图片下载流程，开始切换串口波特率...')
-                        try:
-                            self.module_serial.baudrate = baudrate
-                            if getattr(self, 'download_perf', None):
-                                self.download_perf.mark('high_baud')
-                            print(f'[调试-0x51] 串口波特率切换成功')
-                            self.append_module_log(f'串口波特率已切换到 {baudrate}')
-
-                            # 延迟30ms后再发送下一个指令，等待模组稳定
-                            QTimer.singleShot(30, self.send_get_image_size_command)
-
-                        except Exception as e:
-                            print(f'[调试-0x51] 切换波特率异常: {e}')
-                            self.append_module_log(f'[错误] 切换波特率失败: {e}', error=True)
-                            self.is_downloading = False
-                            self.end_download_performance('中止（切换波特率失败）')
-                    elif baudrate == 115200 and self.module_serial:
-                        # 恢复标准波特率
-                        print(f'[调试-0x51] 恢复标准波特率')
-                        try:
-                            self.module_serial.baudrate = baudrate
-                        except Exception as e:
-                            self.end_download_performance('中止（恢复波特率失败）')
-                            self.append_module_log(f'[错误] 恢复波特率失败: {e}', error=True)
-                            return
-                        self.append_module_log(f'串口波特率已恢复到 {baudrate}')
-                        perf = getattr(self, 'download_perf', None)
-                        if perf:
-                            perf.mark('restored')
-                            outcome = '完成' if 'preview' in perf.stages else '中止（传输未完成）'
-                            self.end_download_performance(outcome)
-
-                        # 判断是否是待机恢复波特率
-                        if getattr(self, 'is_standby_restoring', False):
-                            print(f'[调试-0x51] 这是待机恢复波特率，不触发图片下载')
-                            self.is_standby_restoring = False  # 重置标志
-                        else:
-                            # 图片下载流程完成
-                            self.append_module_log('[完成] 图片下载流程完成！', success=True)
-
-                            # 检查是否需要执行序列的下一步
-                            if self.download_type == 'jpeg':
-                                self.check_sequence_next('下载JPEG')
-                            elif self.download_type == 'raw':
-                                self.check_sequence_next('下载RAW')
-                    else:
-                        print(f'[调试-0x51] 波特率={baudrate}, 不执行切换逻辑')
-                else:
-                    self.append_module_log(f'设置波特率成功（无法确定波特率值） {elapsed_time}', success=True)
+            if self.ota_in_progress and self.ota_stage == 7:
+                original_baudrate = self.ota_original_baudrate
+                try:
+                    self.module_serial.baudrate = original_baudrate
+                    self.append_module_log(
+                        f'[OTA] 本机串口波特率已恢复到 {original_baudrate}', success=True
+                    )
+                    self.finish_ota('升级完成')
+                except Exception as error:
+                    self.append_module_log(f'[OTA] 本机恢复波特率失败: {error}', error=True)
+                    self.finish_ota('升级完成（本机恢复波特率失败）')
+            elif self.ota_in_progress and self.ota_stage == 1:
+                actual_baudrate = getattr(self, 'ota_target_baudrate', 1500000)
+                try:
+                    self.module_serial.baudrate = actual_baudrate
+                    self.append_module_log(f'[OTA] 串口波特率已切换到 {actual_baudrate}')
+                    self.ota_stage = 2
+                    self.schedule_ota_step(100, 2, self.enter_ota_mode)
+                except Exception as error:
+                    self.append_module_log(f'[OTA] 切换波特率失败: {error}', error=True)
+                    self.finish_ota('中止（切换波特率失败）')
+            elif getattr(self, 'is_standby_restoring', False):
+                try:
+                    self.module_serial.baudrate = 115200
+                    self.append_module_log('[待机] 串口波特率已恢复到 115200')
+                except Exception as error:
+                    self.append_module_log(f'[警告] 恢复波特率失败: {error}', error=True)
+                finally:
+                    self.is_standby_restoring = False
+            elif download_preparing and 'preview' not in download_perf.stages:
+                try:
+                    self.module_serial.baudrate = 1500000
+                    download_perf.mark('high_baud')
+                    self.append_module_log('串口波特率已切换到 1500000')
+                    QTimer.singleShot(30, self.send_get_image_size_command)
+                except Exception as error:
+                    self.append_module_log(f'[错误] 切换波特率失败: {error}', error=True)
+                    self.is_downloading = False
+                    self.end_download_performance('中止（切换波特率失败）')
+            elif download_preparing and 'preview' in download_perf.stages:
+                try:
+                    self.module_serial.baudrate = 115200
+                except Exception as error:
+                    self.end_download_performance('中止（恢复波特率失败）')
+                    self.append_module_log(f'[错误] 恢复波特率失败: {error}', error=True)
+                    return
+                self.append_module_log('串口波特率已恢复到 115200')
+                download_perf.mark('restored')
+                self.end_download_performance('完成')
+                self.append_module_log('[完成] 图片下载流程完成！', success=True)
+                self.check_sequence_next(
+                    '下载JPEG' if self.download_type == 'jpeg' else '下载RAW'
+                )
             else:
-                self.append_module_log(f'设置波特率失败 {elapsed_time}', error=True)
+                # 有业务语义但没有活动流程时，只确认回复，绝不推断并启动下载。
+                self.append_module_log('[波特率] 当前无待推进的下载、OTA或待机流程')
+
+        elif not command_context and msg_id == '0x51':
+            # 未登记来源的0x51回复可能来自外部工具或迟到/重复回复。
+            # 只展示，不改变本机串口，也不进入图片下载状态机。
+            self.append_module_log(
+                f'[波特率] 收到未关联流程的回复，结果码: 0x{result:02X} {elapsed_time}'
+            )
 
         elif function_key == 'get_jpeg_size' or (not command_context and msg_id == '0x14'):  # 获取JPEG图片大小
             if result == 0x00:
@@ -7115,10 +7197,38 @@ class MainWindow(QMainWindow):
                 print(f'[OTA调试] Note完整数据: {hex_data}')
                 if status == 0x00:
                     if self.ota_in_progress and self.ota_stage == 6:
-                        self.append_module_log('[OTA] 模组重启成功，OTA升级完成！', success=True)
+                        self.append_module_log('[OTA] 模组重启成功，OTA主体升级完成！', success=True)
                         if getattr(self, 'ota_perf', None):
                             self.ota_perf.mark('ready')
-                        self.finish_ota('升级完成')
+                        if self.ota_set_baudrate:
+                            baudrate_codes = {
+                                115200: 0x01,
+                                230400: 0x02,
+                                460800: 0x03,
+                                1500000: 0x04,
+                            }
+                            restore_code = baudrate_codes.get(self.ota_original_baudrate)
+                            if restore_code is None:
+                                self.append_module_log(
+                                    f'[OTA] 原始波特率 {self.ota_original_baudrate} 无恢复代码，'
+                                    '跳过恢复并完成升级'
+                                )
+                                self.finish_ota('升级完成（未恢复波特率）')
+                            elif self.ota_original_baudrate == getattr(
+                                    self.module_serial, 'baudrate', None):
+                                self.finish_ota('升级完成')
+                            else:
+                                self.ota_stage = 7
+                                self.append_module_log(
+                                    f'[OTA] 恢复原波特率 {self.ota_original_baudrate}'
+                                )
+                                if not self.send_protocol_command(
+                                        'set_baudrate',
+                                        runtime_values={'BAUD_CODE': restore_code}):
+                                    self.finish_ota('升级完成（恢复指令发送失败）')
+                        else:
+                            self.append_module_log('[OTA] 不设置波特率模式，跳过结束恢复')
+                            self.finish_ota('升级完成')
                     else:
                         self.append_module_log('[模组] Ready消息收到', success=True)
                 elif self.ota_in_progress and self.ota_stage == 6:
@@ -7173,7 +7283,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.append_module_log(f'[状态] {status_msg}')
 
-            elif nid == 0x04 or (note_modality == 'palm' and note_variant == 'dsm'):  # 手掌Note消息（DSM模式）
+            elif nid == 0x08 or (note_modality == 'palm' and note_variant == 'dsm'):  # 手掌Note消息（DSM模式）
                 # 第1字节是0x04，第2字节是状态信息
                 status = data[1]
 
@@ -7212,7 +7322,7 @@ class MainWindow(QMainWindow):
                 status_msg = palm_status_messages.get(status, f'未知错误 (0x{status:02X})')
                 self.append_module_log(f'[手掌状态] {status_msg}')
 
-            elif nid == 0x08 or (note_modality == 'palm' and note_variant == 'kds'):  # 手掌Note消息（KDS模式）
+            elif nid == 0x04 or (note_modality == 'palm' and note_variant == 'kds'):  # 手掌Note消息（KDS模式）
                 # 第1字节是0x05，第2字节是状态信息
                 status = data[1]
 
@@ -7249,7 +7359,7 @@ class MainWindow(QMainWindow):
                 }
 
                 status_msg = kds_palm_status_messages.get(status, f'未知错误 (0x{status:02X})')
-                self.append_module_log(f'[KDS手掌状态] {status_msg}')
+                self.append_module_log(f'[手掌状态] {status_msg}')
 
             else:
                 self.append_module_log(f'[Note消息] 未知NID: 0x{nid:02X}')
@@ -7404,6 +7514,37 @@ class MainWindow(QMainWindow):
             return False
         return self.send_module_packet(packet)
 
+    def send_custom_raw_packet(self, packet):
+        """原样发送自定义完整帧；回复只展示，不推进内置业务流程。"""
+        packet = bytes(packet)
+        if len(packet) < 3:
+            QMessageBox.warning(self, '输入错误', '完整帧长度不足，无法识别消息ID。')
+            return False
+        msg_id = packet[2]
+        modality = self.current_operation_modality()
+        profile_id = self.active_protocol_profile_id
+        context = self._store_command_context(
+            msg_id, 'custom_raw', modality, packet, profile_id
+        )
+        # 自定义0x51仍不推进下载/OTA，但成功回复后必须同步切换本机串口，
+        # 否则模组已进入新波特率，而后续自定义命令仍会按旧波特率发出。
+        if packet[:3] == b'\xEF\xAA\x51' and len(packet) >= 7:
+            data_size = int.from_bytes(packet[3:5], byteorder='big')
+            if data_size >= 1 and len(packet) == data_size + 6:
+                baudrate_map = {
+                    0x01: 115200,
+                    0x02: 230400,
+                    0x03: 460800,
+                    0x04: 1500000,
+                }
+                target_baudrate = baudrate_map.get(packet[5])
+                if target_baudrate:
+                    context['custom_baudrate_target'] = target_baudrate
+        if not self.send_module_packet(packet, context):
+            self._discard_command_context(context)
+            return False
+        return True
+
     def send_module_packet(self, message, context=None):
         """发送已经校验/渲染完成的完整协议帧。"""
         if not self.module_connected or not self.module_serial:
@@ -7430,6 +7571,15 @@ class MainWindow(QMainWindow):
             write_started = build_started if ota_perf else time.perf_counter()
             if ota_perf:
                 ota_perf.add('协议封装/校验', 0.0)
+            if (function_key == 'set_baudrate' and getattr(self, 'ota_in_progress', False)
+                    and getattr(self, 'ota_stage', 0) == 1):
+                payload_hex = message[5:-1].hex(' ').upper() if len(message) >= 6 else '空'
+                # self.append_module_log(
+                #     f'[OTA诊断] 发送设置波特率: packet={message.hex(" ").upper()}, '
+                #     f'data={payload_hex}, 目标波特率={getattr(self, "ota_target_baudrate", "未知")}, '
+                #     f'发送前本机波特率={getattr(self.module_serial, "baudrate", "未知")}, '
+                #     f'上下文序号={context.get("sequence") if context else "无"}'
+                # )
             self.module_serial.write(message)
             written_at = time.perf_counter()
             self.module_serial.flush()
@@ -8384,6 +8534,16 @@ class MainWindow(QMainWindow):
         self.ota_step_timer.start(delay)
 
     def finish_ota(self, outcome):
+        if outcome.startswith('中止'):
+            pending = self.pending_command
+            pending_function = (
+                pending.get('function_key') if isinstance(pending, dict) else None
+            )
+            # self.append_module_log(
+            #     f'[OTA诊断] 结束: outcome={outcome}, 当前阶段={self.ota_stage}, '
+            #     f'pending={pending_function or "无"}, '
+            #     f'本机波特率={getattr(self.module_serial, "baudrate", "未知")}'
+            # )
         self.ota_in_progress = False
         self.ota_stage = 0
         if not getattr(self, 'is_downloading', False) \
@@ -8420,6 +8580,8 @@ class MainWindow(QMainWindow):
         self.ota_perf = None
         if perf and outcome.startswith('中止'):
             self.append_module_log(f'[OTA] {outcome}', error=True)
+        elif outcome.startswith('升级完成'):
+            self.append_module_log(f'[OTA] {outcome}', success=True)
 
     def record_ota_ack_timing(self, timing):
         perf = getattr(self, 'ota_perf', None)
@@ -8465,6 +8627,13 @@ class MainWindow(QMainWindow):
         self.ota_baudrate_combo = QComboBox()
         self.ota_baudrate_combo.addItems(['115200', '230400', '460800', '1500000'])
         self.ota_baudrate_combo.setCurrentText('1500000')
+        ota_sets_baudrate = self.ota_baudrate_mode_actions['set'].isChecked()
+        self.ota_baudrate_combo.setEnabled(ota_sets_baudrate)
+        if ota_sets_baudrate:
+            self.ota_baudrate_combo.setToolTip('OTA开始时设置到所选波特率，完成后恢复连接时波特率')
+        else:
+            current_baudrate = getattr(self.module_serial, 'baudrate', self.module_baudrate)
+            self.ota_baudrate_combo.setToolTip(f'当前选择不设置波特率，将保持 {current_baudrate}')
         baudrate_layout.addWidget(self.ota_baudrate_combo)
         baudrate_layout.addStretch()
         layout.addLayout(baudrate_layout)
@@ -8546,31 +8715,44 @@ class MainWindow(QMainWindow):
 
             self.append_module_log(f'[OTA] 配置: 单包大小={self.ota_packet_size}字节, 总包数={self.ota_total_packets}')
 
-            # 开始OTA流程
+            # 开始OTA流程并锁定本次波特率策略。
             self.ota_in_progress = True
-            self.ota_stage = 1
             self.ota_current_packet = 0
-
-            # 步骤1: 设置波特率（根据用户选择）
-            baudrate_str = self.ota_baudrate_combo.currentText()
-            baudrate_map = {
-                '115200': (0x01, 115200),
-                '230400': (0x02, 230400),
-                '460800': (0x03, 460800),
-                '1500000': (0x04, 1500000),
-            }
-            baudrate_code, baudrate_value = baudrate_map.get(baudrate_str, (0x04, 1500000))
-
-            self.append_module_log(f'[OTA] 步骤1: 设置波特率为 {baudrate_value}')
-            # 保存目标波特率，供0x51响应处理使用
-            self.ota_target_baudrate = baudrate_value
-            self.ota_perf.baudrate = baudrate_value
             self.ota_retry_count = 0
             self.ota_waiting_ack = False
-            print(f'[OTA调试] 发送0x51指令，波特率代码: 0x{baudrate_code:02X}, 目标波特率: {baudrate_value}')
-            if not self.send_protocol_command(
-                    'set_baudrate', runtime_values={'BAUD_CODE': baudrate_code}):
-                self.finish_ota('中止（波特率指令发送失败）')
+            self.ota_set_baudrate = self.ota_baudrate_mode_actions['set'].isChecked()
+            current_baudrate = getattr(self.module_serial, 'baudrate', None)
+            if not isinstance(current_baudrate, int):
+                current_baudrate = self.module_baudrate or 115200
+            self.ota_original_baudrate = current_baudrate
+
+            if self.ota_set_baudrate:
+                self.ota_stage = 1
+                baudrate_str = self.ota_baudrate_combo.currentText()
+                baudrate_map = {
+                    '115200': (0x01, 115200),
+                    '230400': (0x02, 230400),
+                    '460800': (0x03, 460800),
+                    '1500000': (0x04, 1500000),
+                }
+                baudrate_code, baudrate_value = baudrate_map.get(
+                    baudrate_str, (0x04, 1500000)
+                )
+                self.ota_target_baudrate = baudrate_value
+                self.ota_perf.baudrate = baudrate_value
+                self.append_module_log(f'[OTA] 步骤1: 设置波特率为 {baudrate_value}')
+                print(f'[OTA调试] 发送0x51指令，波特率代码: 0x{baudrate_code:02X}, 目标波特率: {baudrate_value}')
+                if not self.send_protocol_command(
+                        'set_baudrate', runtime_values={'BAUD_CODE': baudrate_code}):
+                    self.finish_ota('中止（波特率指令发送失败）')
+            else:
+                self.ota_target_baudrate = self.ota_original_baudrate
+                self.ota_perf.baudrate = self.ota_original_baudrate
+                self.ota_stage = 2
+                self.append_module_log(
+                    f'[OTA] 跳过波特率设置，保持当前 {self.ota_original_baudrate}'
+                )
+                self.schedule_ota_step(0, 2, self.enter_ota_mode)
 
         except Exception as e:
             self.finish_ota('中止（OTA启动失败）')
