@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.CapLGRemote" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#2370DE</item>
+        <item name="android:navigationBarColor">#EEF3F9</item>
+        <item name="android:statusBarColor">#EEF3F9</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

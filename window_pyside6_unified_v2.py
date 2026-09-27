@@ -34,10 +34,12 @@ from PySide6.QtWidgets import (
     QGridLayout, QMenu, QListWidget, QListWidgetItem, QWidgetAction, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QDialogButtonBox
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QSize, QEvent, QPoint
+from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QSize, QEvent, QPoint, QByteArray, QBuffer, QIODevice
 from PySide6.QtGui import QFont, QTextCursor, QPalette, QColor, QPixmap, QImage, QTextDocument, QShortcut, QKeySequence, QTransform, QTextCharFormat, QIcon, QActionGroup, QTextBlockUserData
 
 import theme_icons_rc  # 注册内嵌图标，源码运行和打包后均不依赖外部图片路径
+from remote_control_server import REMOTE_ACTIONS, RemoteControlServer
+from qr_code import generate_qr_image
 
 from datetime import datetime
 from collections import deque
@@ -46,6 +48,7 @@ from watchdog.events import FileSystemEventHandler
 
 from config_manager import load_config, save_config
 import protocol_profiles as protocol_defs
+import mimetypes
 
 # ==============================
 # ANSI 转义序列清理
@@ -520,6 +523,59 @@ def _save_last_selection(data):
 # ==============================
 # 协议组管理
 # ==============================
+
+class RemoteConnectionDialog(QDialog):
+    """显示手机热点访问地址、自动配对URL和二维码。"""
+
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('手机远程控制连接')
+        self.resize(520, 620)
+        layout = QVBoxLayout(self)
+        title = QLabel('请让手机和电脑连接同一个手机热点')
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        self.qr_label = QLabel()
+        self.qr_label.setAlignment(Qt.AlignCenter)
+        self.qr_label.setMinimumSize(280, 280)
+        layout.addWidget(self.qr_label)
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self.url_text = QTextEdit()
+        self.url_text.setReadOnly(True)
+        self.url_text.setMaximumHeight(110)
+        layout.addWidget(self.url_text)
+        buttons = QHBoxLayout()
+        copy_button = QPushButton('复制自动连接地址')
+        copy_button.clicked.connect(self.copy_urls)
+        buttons.addWidget(copy_button)
+        close_button = QPushButton('关闭')
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        self.info = info
+        self._render()
+
+    def _render(self):
+        urls = self.info.get('auto_urls') or self.info.get('urls') or []
+        auto_url = urls[0] if urls else ''
+        try:
+            image = generate_qr_image(auto_url).scaled(
+                300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.qr_label.setPixmap(QPixmap.fromImage(image))
+        except RuntimeError as error:
+            self.qr_label.setText(f'二维码暂不可用：\n{error}')
+        self.status_label.setText(
+            f'扫码后将自动打开并完成配对。\n备用配对码：{self.info.get("pair_code", "")}'
+        )
+        self.url_text.setPlainText('\n'.join(urls) or '没有发现可用地址')
+
+    def copy_urls(self):
+        urls = self.info.get('auto_urls') or self.info.get('urls') or []
+        QApplication.clipboard().setText('\n'.join(urls))
+
 
 class ProtocolProfilesDialog(QDialog):
     """管理基于DSM继承的完整模组帧模板。"""
@@ -2356,11 +2412,12 @@ class MainWindow(QMainWindow):
     new_image_signal = Signal(str)
     module_response_signal = Signal(str, bytes)  # 模组响应信号 (command_type, data)
     custom_command_data_signal = Signal(bytes)  # 自定义命令原始数据信号
+    remote_action_signal = Signal(str, str, object)
 
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle('串口日志采集工具 v1.0.1.0')
+        self.setWindowTitle('串口日志采集工具 v1.0.1.1')
         self.resize(1400, 800)
 
         # 串口相关
@@ -2477,6 +2534,17 @@ class MainWindow(QMainWindow):
         # 自定义命令对话框
         self.custom_command_dialog = None
 
+        # 手机热点局域网遥控服务，默认关闭。
+        self.remote_action_signal.connect(self._execute_remote_action)
+        self.remote_control_server = RemoteControlServer(
+            self._queue_remote_action, self.remote_status_snapshot
+        )
+        self.remote_control_server.set_response_text('')
+        self.remote_control_menu = None
+        self.action_remote_toggle = None
+        self.action_remote_info = None
+        self.remote_response_snapshot = ''
+
         self.setup_ui()
         self.setup_signals()
         self.load_saved_config()
@@ -2548,6 +2616,12 @@ class MainWindow(QMainWindow):
         self.action_copy_monitor_path = self.image_paths_menu.addAction('复制图片监控目录')
         self.action_open_monitor_path = self.image_paths_menu.addAction('跳转图片监控目录')
         self.action_log_markers = self.main_functions_menu.addAction('📍 日志打点')
+        self.remote_control_menu = self.main_functions_menu.addMenu('📱 手机远程控制')
+        self.action_remote_toggle = self.remote_control_menu.addAction('开启远程控制')
+        self.action_remote_info = self.remote_control_menu.addAction('查看连接信息')
+        self.action_remote_toggle.triggered.connect(self.toggle_remote_control)
+        self.action_remote_info.triggered.connect(self.show_remote_control_info)
+        self.action_remote_info.setEnabled(False)
         self.main_functions_menu.addSeparator()
         self.action_save_log = self.main_functions_menu.addAction('💾 保存日志')
         self.action_open_output = self.main_functions_menu.addAction('📂 打开保存目录')
@@ -3435,6 +3509,105 @@ class MainWindow(QMainWindow):
         self.escape_shortcut = QShortcut(QKeySequence('Esc'), self)
         self.escape_shortcut.activated.connect(self.hide_search_bar)
 
+    def remote_status_snapshot(self):
+        """提供给HTTP线程的无控件状态快照。"""
+        return {
+            'module_connected': bool(self.module_connected),
+            'protocol_profile': self.get_protocol_profile_name(),
+            'operation_mode': '人脸' if self.current_operation_modality() == 'face' else '手掌',
+            'busy': bool(self.protocol_change_locked()),
+            'response_text': self.remote_response_snapshot[-20000:],
+        }
+
+    def _queue_remote_action(self, action_name, session_token):
+        """HTTP线程只排队信号；真正动作在Qt主线程执行。"""
+        result = {'ok': False, 'message': '操作尚未执行'}
+        done = threading.Event()
+        self.remote_action_signal.emit(action_name, session_token, (result, done))
+        if not done.wait(2):
+            return {'ok': False, 'message': '主界面忙，操作未及时执行'}
+        return result
+
+    def _execute_remote_action(self, action_name, session_token, completion):
+        result, done = completion
+        result.update(self.handle_remote_action(action_name, session_token))
+        done.set()
+
+    def handle_remote_action(self, action_name, session_token=''):
+        """在Qt主线程执行白名单远程动作。"""
+        if action_name == '__custom__':
+            try:
+                config = json.loads(session_token)
+                name = str(config.get('name', '')).strip()
+                packet = bytes.fromhex(str(config.get('hex', '')))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                return {'ok': False, 'message': '自定义命令格式无效'}
+            if not self.module_connected:
+                return {'ok': False, 'message': '模组未连接'}
+            if self.ota_in_progress or self.is_downloading:
+                return {'ok': False, 'message': '当前正在下载或OTA，暂不能执行'}
+            if not self.send_custom_raw_packet(packet):
+                return {'ok': False, 'message': '自定义命令发送失败'}
+            hex_text = ' '.join(f'{value:02X}' for value in packet)
+            self.append_module_log(f'[远程自定义命令] {name}: {hex_text}')
+            return {'ok': True, 'message': f'已发送：{name}'}
+        actions = {
+            'face_register': self.register_single_frame,
+            'face_recognize': self.face_recognition,
+            'palm_register': self.palm_register,
+            'palm_recognize': self.palm_recognition,
+            'get_version': self.get_module_version,
+            'get_users': self.get_all_user_ids,
+            'download_jpeg': self.download_image,
+            'download_raw': self.download_raw_image,
+        }
+        callback = actions.get(action_name)
+        if callback is None:
+            return {'ok': False, 'message': '不支持的远程操作'}
+        if not self.module_connected:
+            return {'ok': False, 'message': '模组未连接'}
+        if action_name in ('download_jpeg', 'download_raw'):
+            if self.protocol_change_locked():
+                return {'ok': False, 'message': '当前已有任务运行中'}
+        elif self.ota_in_progress or self.is_downloading:
+            return {'ok': False, 'message': '当前正在下载或OTA，暂不能执行'}
+        try:
+            callback()
+            self.append_module_log(f'[远程控制] 已请求：{REMOTE_ACTIONS[action_name]}')
+            return {'ok': True, 'message': f'已请求：{REMOTE_ACTIONS[action_name]}'}
+        except Exception as error:
+            self.append_module_log(f'[远程控制] 执行失败：{error}', error=True)
+            return {'ok': False, 'message': f'执行失败：{error}'}
+
+    def toggle_remote_control(self):
+        if self.remote_control_server.started:
+            self.remote_control_server.stop()
+            self.action_remote_toggle.setText('开启远程控制')
+            self.action_remote_info.setEnabled(False)
+            self.append_module_log('[远程控制] 服务已停止')
+            return
+        try:
+            info = self.remote_control_server.start()
+            self.action_remote_toggle.setText('关闭远程控制')
+            self.action_remote_info.setEnabled(True)
+            addresses = '\n'.join(
+                info.get('urls') or [
+                    f'http://{address}:{info["port"]}'
+                    for address in info.get('addresses', [])
+                ]
+            ) or f'http://127.0.0.1:{info["port"]}'
+            self.append_module_log(f'[远程控制] 已启动（API v2）：{addresses}，配对码：{info["pair_code"]}')
+            self.show_remote_control_info()
+        except OSError as error:
+            QMessageBox.critical(self, '远程控制', f'启动远程服务失败：\n{error}')
+
+    def show_remote_control_info(self):
+        info = self.remote_control_server.connection_info()
+        if not info.get('started'):
+            QMessageBox.information(self, '远程控制', '远程控制服务尚未启动')
+            return
+        RemoteConnectionDialog(info, self).exec()
+
     def setup_signals(self):
         """设置信号连接"""
         self.log_signal.connect(self.append_log)
@@ -3504,6 +3677,7 @@ class MainWindow(QMainWindow):
     def clear_module_response(self):
         """清空模组响应信息显示"""
         self.module_response_text.clear()
+        self.remote_response_snapshot = ''
         print('[调试] 已清空模组响应信息显示')
 
     def _add_exclusive_mode_menu(self, title, items, checked_key):
@@ -4872,6 +5046,38 @@ class MainWindow(QMainWindow):
 
         self.display_image_previews(image_files[:10])
 
+    def update_remote_image_preview(self, image_files, display_name=''):
+        items = []
+        for path in image_files[:10]:
+            try:
+                resolved = Path(path).resolve(strict=True)
+                suffix = resolved.suffix.lower()
+                previewable = suffix in ('.jpg', '.jpeg', '.png', '.bmp', '.gif')
+                item = {
+                    'name': resolved.name,
+                    'size': resolved.stat().st_size,
+                    'mime': mimetypes.guess_type(str(resolved))[0] or 'application/octet-stream',
+                    'previewable': previewable,
+                }
+                if previewable:
+                    image = QImage(str(resolved))
+                    if not image.isNull():
+                        if max(image.width(), image.height()) > 1280:
+                            image = image.scaled(1280, 1280, Qt.KeepAspectRatio,
+                                                 Qt.SmoothTransformation)
+                        buffer = QByteArray()
+                        io = QBuffer(buffer)
+                        io.open(QIODevice.WriteOnly)
+                        image.save(io, 'JPEG', 85)
+                        item['data'] = bytes(buffer)
+                        item['mime'] = 'image/jpeg'
+                    else:
+                        item['previewable'] = False
+                items.append(item)
+            except (OSError, RuntimeError):
+                continue
+        self.remote_control_server.set_preview_items(items, display_name)
+
     def display_image_previews(self, image_files):
         """统一缩略图和双击入口，每次查看器使用当前组的图片快照"""
         while self.image_layout.count():
@@ -4880,6 +5086,7 @@ class MainWindow(QMainWindow):
                 item.widget().deleteLater()
 
         if not image_files:
+            self.remote_control_server.clear_preview()
             label = QLabel('该文件夹中没有找到图片文件')
             label.setAlignment(Qt.AlignCenter)
             label.setStyleSheet('color: #999999; padding: 20px;')
@@ -4898,12 +5105,17 @@ class MainWindow(QMainWindow):
                 print(f'加载图片失败: {img_path}, {e}')
 
         if not valid_images:
+            self.remote_control_server.clear_preview()
             label = QLabel('该文件夹中没有找到可显示的图片文件')
             label.setAlignment(Qt.AlignCenter)
             label.setStyleSheet('color: #999999; padding: 20px;')
             self.image_layout.addWidget(label, 1)
             return
 
+        self.update_remote_image_preview(
+            [path for path, _ in valid_images[:10]],
+            getattr(getattr(self, 'current_image_data', None), 'display_name', '')
+        )
         max_columns = min(len(valid_images), 2)
         preview_container = QWidget()
         preview_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -5036,6 +5248,11 @@ class MainWindow(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
 
+        self.update_remote_image_preview(
+            [path for path in (self.current_image_data.ir_path,
+                               self.current_image_data.rgb_path) if path],
+            getattr(self.current_image_data, 'display_name', 'RAW')
+        )
         # 显示提示信息
         placeholder_label = QLabel(
             '📁 RAW图已下载\n\n'
@@ -8361,6 +8578,9 @@ class MainWindow(QMainWindow):
         cursor.insertText(log + '\n')
 
         self.module_response_text.moveCursor(QTextCursor.End)
+        if getattr(self, 'remote_control_server', None) and self.remote_control_server.started:
+            self.remote_response_snapshot = self.module_response_text.toPlainText()[-20000:]
+            self.remote_control_server.set_response_text(self.remote_response_snapshot)
 
     # === 自动执行序列相关方法 ===
     def add_sequence_operation(self):
@@ -8919,6 +9139,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """关闭事件"""
+        if getattr(self, 'remote_control_server', None):
+            self.remote_control_server.stop()
         # 先释放日志串口，避免daemon线程依赖进程退出强制关闭句柄。
         if self.is_log_port_active():
             self.disconnect_serial()
@@ -8947,7 +9169,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName('capLG')
-    app.setApplicationVersion('1.0.1.0')
+    app.setApplicationVersion('1.0.1.1')
     icon_name = 'AppIcon.png'
     if getattr(sys, 'frozen', False):
         icon_path = os.path.join(sys._MEIPASS, 'resources', icon_name)
