@@ -1,11 +1,26 @@
 package com.caplg.remote
 
 import android.Manifest
+import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.BitmapFactory
 import android.graphics.drawable.GradientDrawable
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.content.Context
 import android.graphics.drawable.RippleDrawable
 import android.content.res.ColorStateList
 import android.view.MotionEvent
@@ -31,7 +46,6 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
 import okhttp3.MediaType.Companion.toMediaType
@@ -52,9 +66,14 @@ class MainActivity : ComponentActivity() {
     private var pollingView: View? = null
     private var pollingTask: Runnable? = null
     private var supportsCustomAction = false
+    private var pendingSaveBitmap: Bitmap? = null
+    private val PERMISSION_REQUEST_WRITE = 1001
     private val mainHandler = Handler(Looper.getMainLooper())
     private val connectionPrefs by lazy { getSharedPreferences("connection", MODE_PRIVATE) }
     private val commandPrefs by lazy { getSharedPreferences("custom_commands", MODE_PRIVATE) }
+    private val settingsPrefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
+    private var currentStatus = ""
+    private val vibrator by lazy { getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
 
     data class CustomCommand(val id: String, val name: String, val hex: String)
 
@@ -131,6 +150,20 @@ class MainActivity : ComponentActivity() {
         pollingTask?.let { task -> pollingView?.removeCallbacks(task) }
         pollingTask = null
         pollingView = null
+    }
+
+    private fun vibrateIfEnabled() {
+        if (!settingsPrefs.getBoolean("vibrate_on_command", true)) return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(50)
+            }
+        } catch (e: Exception) {
+            Log.e("capLGRemote", "vibrate failed", e)
+        }
     }
 
     private fun showConnectionChoice() {
@@ -265,23 +298,44 @@ class MainActivity : ComponentActivity() {
     private fun showControls() {
         stopPolling()
         root = baseLayout()
-        val previewTitle = TextView(this).apply {
-            text = "图片预览"
-            textSize = 20f
-            setTextColor(Color.rgb(23, 32, 42))
-            visibility = View.GONE
+
+        // 图片预览区域（可折叠）
+        var previewExpanded = true
+        val previewButton = Button(this).apply {
+            text = "▼ 图片预览"
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            background = rounded(Color.rgb(138, 99, 210), 12)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
         }
         val previewRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             visibility = View.GONE
         }
-        root.addView(previewTitle)
+        previewButton.setOnClickListener {
+            previewExpanded = !previewExpanded
+            previewRow.visibility = if (previewExpanded) View.VISIBLE else View.GONE
+            previewButton.text = if (previewExpanded) "▼ 图片预览" else "▶ 图片预览"
+        }
+        root.addView(previewButton, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(dp(6), dp(6), dp(6), dp(6))
+        })
         root.addView(previewRow, LinearLayout.LayoutParams(-1, dp(150)))
-        root.addView(TextView(this).apply {
-            text = "模组响应"
-            textSize = 20f
-            setTextColor(Color.rgb(23, 32, 42))
+
+        // 模组响应区域（可折叠）
+        var responseExpanded = true
+        val responseButton = Button(this).apply {
+            text = "▼ 模组响应"
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            background = rounded(Color.rgb(35, 112, 222), 12)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+        }
+        root.addView(responseButton, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(dp(6), dp(6), dp(6), dp(6))
         })
 
         val responseScroll = ScrollView(this).apply {
@@ -307,6 +361,13 @@ class MainActivity : ComponentActivity() {
             toBottom.visibility = View.GONE
         }
         root.addView(toBottom, LinearLayout.LayoutParams(-1, -2))
+
+        responseButton.setOnClickListener {
+            responseExpanded = !responseExpanded
+            responseScroll.visibility = if (responseExpanded) View.VISIBLE else View.GONE
+            toBottom.visibility = if (responseExpanded) toBottom.visibility else View.GONE
+            responseButton.text = if (responseExpanded) "▼ 模组响应" else "▶ 模组响应"
+        }
 
         val buttonScroll = ScrollView(this).apply { isFillViewport = true }
         val buttonGrid = GridLayout(this).apply {
@@ -335,6 +396,7 @@ class MainActivity : ComponentActivity() {
         }
         actions.forEachIndexed { index, item ->
             val button = modernButton(item.label, item.color) {
+                vibrateIfEnabled()
                 postJson("/api/action", JSONObject().put("action", item.name)) {
                     showMessage(it.optString("message"))
                 }
@@ -348,6 +410,7 @@ class MainActivity : ComponentActivity() {
                 val customs = loadCustomCommands()
             customs.forEachIndexed { offset, command ->
                 val button = modernButton(command.name, Color.rgb(74, 100, 130)) {
+                    vibrateIfEnabled()
                     if (!supportsCustomAction) {
                         showMessage("电脑端版本过旧，请更新并重启远程服务（需要API v2）")
                     } else {
@@ -399,24 +462,32 @@ class MainActivity : ComponentActivity() {
         buttonScroll.addView(buttonGrid)
         root.addView(buttonScroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val status = TextView(this).apply {
-            textSize = 13f
-            setTextColor(Color.rgb(55, 69, 83))
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = rounded(Color.WHITE, 13, Color.rgb(210, 221, 232))
-        }
-        root.addView(status, LinearLayout.LayoutParams(-1, -2).apply {
-            setMargins(0, dp(6), 0, dp(6))
-        })
         message = TextView(this).apply {
             setTextColor(Color.rgb(36, 93, 156))
             setPadding(dp(4), dp(4), dp(4), dp(4))
         }
         root.addView(message)
-        root.addView(modernButton("连接选项", Color.rgb(96, 111, 128)) {
-            showConnectionChoice()
-        }, LinearLayout.LayoutParams(-1, dp(58)))
+
         setContentView(root)
+
+        // 右下角设置按钮（浮动在最上层）
+        val settingsButton = Button(this).apply {
+            text = "⚙"
+            textSize = 24f
+            setTextColor(Color.WHITE)
+            background = rounded(Color.rgb(96, 111, 128), 28)
+            elevation = dp(6).toFloat()
+            setOnClickListener {
+                showSettingsDialog()
+            }
+        }
+        val overlay = android.widget.FrameLayout(this).apply {
+            addView(settingsButton, android.widget.FrameLayout.LayoutParams(dp(56), dp(56)).apply {
+                gravity = Gravity.BOTTOM or Gravity.END
+                setMargins(0, 0, dp(16), dp(16))
+            })
+        }
+        addContentView(overlay, android.widget.FrameLayout.LayoutParams(-1, -1))
 
         var lastResponse = ""
         var lastPreviewVersion = -1
@@ -427,12 +498,12 @@ class MainActivity : ComponentActivity() {
             previewRow.removeAllViews()
             val items = preview.optJSONArray("items") ?: JSONArray()
             if (items.length() == 0) {
-                previewTitle.visibility = View.GONE
+                previewButton.visibility = View.GONE
                 previewRow.visibility = View.GONE
                 return
             }
-            previewTitle.visibility = View.VISIBLE
-            previewRow.visibility = View.VISIBLE
+            previewButton.visibility = View.VISIBLE
+            previewRow.visibility = if (previewExpanded) View.VISIBLE else View.GONE
             for (index in 0 until items.length()) {
                 val item = items.getJSONObject(index)
                 if (!item.optBoolean("previewable")) {
@@ -444,6 +515,9 @@ class MainActivity : ComponentActivity() {
                     val image = ImageView(this).apply {
                         scaleType = ImageView.ScaleType.CENTER_CROP
                         setPadding(dp(3), dp(3), dp(3), dp(3))
+                        setOnClickListener {
+                            if (drawable != null) showFullImage(this, item.optString("name"))
+                        }
                     }
                     previewRow.addView(image, LinearLayout.LayoutParams(0, -1, 1f))
                     loadPreviewImage(item.optString("url"), image)
@@ -472,8 +546,8 @@ class MainActivity : ComponentActivity() {
                             toBottom.visibility = View.GONE
                         } else toBottom.visibility = View.VISIBLE
                     }
-                    status.text = "模组：${if (value.optBoolean("module_connected")) "已连接" else "未连接"}    协议：${value.optString("protocol_profile")}\n模式：${value.optString("operation_mode")}    服务器：$baseUrl"
-                    response.postDelayed(this, 1200)
+                    currentStatus = "模组：${if (value.optBoolean("module_connected")) "已连接" else "未连接"}    协议：${value.optString("protocol_profile")}\n模式：${value.optString("operation_mode")}    服务器：$baseUrl"
+                    response.postDelayed(this, 300)
                 }
             }
         }
@@ -577,6 +651,187 @@ class MainActivity : ComponentActivity() {
                 }
                 dialog.show()
             }
+    }
+
+    private fun showFullImage(source: ImageView, filename: String) {
+        val bitmap = (source.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+        if (bitmap == null) {
+            showMessage("图片加载中，请稍后再试")
+            return
+        }
+        val dialog = android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.BLACK)
+        }
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setBackgroundColor(Color.argb(180, 0, 0, 0))
+        }
+        toolbar.addView(TextView(this).apply {
+            text = filename
+            setTextColor(Color.WHITE)
+            textSize = 16f
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        toolbar.addView(Button(this).apply {
+            text = "保存"
+            setOnClickListener {
+                dialog.dismiss()
+                saveBitmapToGallery(bitmap, filename)
+            }
+        })
+        toolbar.addView(Button(this).apply {
+            text = "关闭"
+            setOnClickListener { dialog.dismiss() }
+        })
+        layout.addView(toolbar, LinearLayout.LayoutParams(-1, -2))
+        var fitMode = true
+        val imageView = ImageView(this).apply {
+            setImageBitmap(bitmap)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setOnClickListener {
+                fitMode = !fitMode
+                scaleType = if (fitMode) ImageView.ScaleType.FIT_CENTER else ImageView.ScaleType.CENTER_INSIDE
+                (parent as? LinearLayout)?.setPadding(0, 0, 0, 0)
+            }
+        }
+        layout.addView(imageView, LinearLayout.LayoutParams(-1, 0, 1f))
+        dialog.setContentView(layout)
+        dialog.show()
+    }
+
+    private fun saveBitmapToGallery(bitmap: Bitmap, filename: String) {
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+                pendingSaveBitmap = bitmap
+                ActivityCompat.requestPermissions(this,
+                    arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), PERMISSION_REQUEST_WRITE)
+                return
+            }
+        }
+        executor.execute {
+            try {
+                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                val displayName = "capLG_${timestamp}_$filename"
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/capLG")
+                    }
+                    val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                    uri?.let {
+                        contentResolver.openOutputStream(it)?.use { out ->
+                            bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                        }
+                    }
+                } else {
+                    val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "capLG")
+                    if (!dir.exists()) dir.mkdirs()
+                    val file = File(dir, displayName)
+                    FileOutputStream(file).use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                    }
+                    contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, ContentValues().apply {
+                        put(MediaStore.Images.Media.DATA, file.absolutePath)
+                    })
+                }
+                runOnUiThread { showMessage("已保存到相册") }
+            } catch (e: Exception) {
+                Log.e("capLGRemote", "save to gallery failed", e)
+                runOnUiThread { showMessage("保存失败：${e.message}") }
+            }
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == PERMISSION_REQUEST_WRITE) {
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                pendingSaveBitmap?.let { saveBitmapToGallery(it, "preview.jpg") }
+                pendingSaveBitmap = null
+            } else {
+                showMessage("需要存储权限才能保存图片")
+            }
+        }
+    }
+
+    private fun showSettingsDialog() {
+        val dialogLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+        }
+
+        dialogLayout.addView(TextView(this).apply {
+            text = "连接状态"
+            textSize = 18f
+            setTextColor(Color.rgb(23, 32, 42))
+            setPadding(0, 0, 0, dp(12))
+        })
+
+        val statusScroll = ScrollView(this).apply {
+            background = rounded(Color.rgb(28, 42, 58), 12, Color.rgb(61, 82, 105))
+        }
+        val statusText = TextView(this).apply {
+            text = currentStatus
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.rgb(217, 240, 255))
+        }
+        statusScroll.addView(statusText)
+        dialogLayout.addView(statusScroll, LinearLayout.LayoutParams(-1, dp(120)).apply {
+            setMargins(0, 0, 0, dp(16))
+        })
+
+        // 震动反馈开关
+        dialogLayout.addView(TextView(this).apply {
+            text = "功能选项"
+            textSize = 18f
+            setTextColor(Color.rgb(23, 32, 42))
+            setPadding(0, dp(16), 0, dp(12))
+        })
+
+        val vibrateRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = rounded(Color.rgb(245, 248, 252), 8, Color.rgb(210, 221, 232))
+        }
+        vibrateRow.addView(TextView(this).apply {
+            text = "指令按钮震动反馈"
+            textSize = 15f
+            setTextColor(Color.rgb(23, 32, 42))
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+
+        val vibrateSwitch = android.widget.Switch(this).apply {
+            isChecked = settingsPrefs.getBoolean("vibrate_on_command", true)
+            setOnCheckedChangeListener { _, isChecked ->
+                settingsPrefs.edit().putBoolean("vibrate_on_command", isChecked).apply()
+                if (isChecked) vibrateIfEnabled()
+            }
+        }
+        vibrateRow.addView(vibrateSwitch)
+        dialogLayout.addView(vibrateRow, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(16))
+        })
+
+        val changeConnectionBtn = modernButton("更改连接", Color.rgb(35, 112, 222)) {
+            showConnectionChoice()
+        }
+        dialogLayout.addView(changeConnectionBtn, LinearLayout.LayoutParams(-1, dp(54)).apply {
+            setMargins(0, 0, 0, dp(12))
+        })
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("设置")
+            .setView(dialogLayout)
+            .setPositiveButton("关闭", null)
+            .create()
+
+        dialog.show()
     }
 
     private fun loadPreviewImage(path: String, target: ImageView) {
