@@ -48,8 +48,13 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Dispatcher
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Response
+import java.io.IOException
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
@@ -57,8 +62,27 @@ import org.json.JSONArray
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
-    private val client = OkHttpClient()
-    private val executor = Executors.newSingleThreadExecutor()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
+    // Only long polls need the longer timeout. Their dispatcher is separate from
+    // action/pair/status requests, so a waiting /api/wait cannot occupy their slots.
+    private val waitClient = client.newBuilder()
+        .dispatcher(Dispatcher())
+        .readTimeout(35, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
+    private val executor = Executors.newSingleThreadExecutor() // camera / image work only
+    private val pendingRequests = mutableSetOf<Call>() // accessed only on the main thread
+    private var pollingCall: Call? = null
+    private var requestGeneration = 0L
+    private var foreground = false
+    private var needsStatusSnapshot = true
+    private var supportsLongPoll = false
+    private var waitEndpointUnavailable = false
+    private var statusRevision: Long? = null
+    private var statusStreamId: String? = null
     private var baseUrl = ""
     private var token = ""
     private lateinit var root: LinearLayout
@@ -73,6 +97,16 @@ class MainActivity : ComponentActivity() {
     private val commandPrefs by lazy { getSharedPreferences("custom_commands", MODE_PRIVATE) }
     private val settingsPrefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
     private var currentStatus = ""
+    private val resultTracker = ResultEventTracker()
+    private val noteTracker = NoteEventTracker()
+    private var lastOperationSequence = 0L
+    private lateinit var resultSpeaker: ResultSpeaker
+    private var resultSupportWarningShown = false
+    private var pairingInProgress = false
+    private var resumeScannerAfterPairCancellation = false
+    private var scannerPreview: PreviewView? = null
+    private val resultSpeechEnabled: Boolean
+        get() = settingsPrefs.getBoolean("speak_final_results", true)
     private val vibrator by lazy { getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
 
     data class CustomCommand(val id: String, val name: String, val hex: String)
@@ -88,6 +122,7 @@ class MainActivity : ComponentActivity() {
             previousHandler?.uncaughtException(thread, error)
         }
         super.onCreate(savedInstanceState)
+        resultSpeaker = ResultSpeaker(this)
         val savedUrl = connectionPrefs.getString("base_url", "").orEmpty()
         val savedToken = connectionPrefs.getString("token", "").orEmpty()
         if (savedUrl.isNotBlank() && savedToken.isNotBlank()) {
@@ -146,10 +181,131 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { action() }
         }
 
+    private fun cancelRequests() {
+        requestGeneration++
+        pollingCall?.cancel()
+        pollingCall = null
+        pendingRequests.forEach { it.cancel() }
+        pendingRequests.clear()
+        needsStatusSnapshot = true
+        // The next request is always /api/status. Do not retain a cursor from a
+        // cancelled generation, even across a pause/resume of the same controls.
+        statusRevision = null
+        statusStreamId = null
+    }
+
     private fun stopPolling() {
         pollingTask?.let { task -> pollingView?.removeCallbacks(task) }
         pollingTask = null
         pollingView = null
+        cancelRequests()
+        supportsLongPoll = false
+        waitEndpointUnavailable = false
+        pairingInProgress = false
+        resumeScannerAfterPairCancellation = false
+        scannerPreview = null
+        resultTracker.leaveControls()
+        noteTracker.reset()
+        if (::resultSpeaker.isInitialized) resultSpeaker.setActive(false)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        foreground = true
+        resultTracker.setForeground(true)
+        resultSpeaker.setActive(resultTracker.isActive && resultSpeechEnabled)
+        // Invalidate any outstanding callback before starting the resume snapshot, even
+        // if a queued callback has not yet delivered its cancellation on the main thread.
+        cancelRequests()
+        // A cancelled pair cannot deliver its callback, and scanning was already unbound.
+        // Return to an explicit scanner rather than leaving a non-polling dead page.
+        if (resumeScannerAfterPairCancellation) {
+            showScanner()
+            showMessage("配对已中断，请重新扫码")
+            return
+        }
+        // Resume with an immediate snapshot; never wait on a stale pre-pause cursor.
+        pollingTask?.let { task ->
+            pollingView?.removeCallbacks(task)
+            pollingView?.post(task)
+        }
+    }
+
+    override fun onPause() {
+        if (pairingInProgress) {
+            resumeScannerAfterPairCancellation = true
+            pairingInProgress = false
+        }
+        foreground = false
+        resultTracker.setForeground(false)
+        resultSpeaker.setActive(false)
+        pollingTask?.let { task -> pollingView?.removeCallbacks(task) }
+        cancelRequests()
+        noteTracker.reset()
+        super.onPause()
+    }
+
+    private fun consumeResultFeed(value: JSONObject) {
+        if (value.opt("supports_result_events") != true) {
+            if (resultSpeechEnabled && !resultSupportWarningShown) {
+                resultSupportWarningShown = true
+                android.widget.Toast.makeText(this, "更新电脑端以启用注册/识别结果语音播报",
+                    android.widget.Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        val raw = value.optJSONObject("result_feed") ?: return
+
+        // 操作序列号只淘汰旧操作的待播 NOTE；网络游标使用 status_revision/status_stream_id。
+        val operationSequence = when (val seq = raw.opt("operation_sequence")) {
+            is Int -> seq.toLong()
+            is Long -> seq
+            else -> 0L
+        }
+        android.util.Log.d("capLGRemote", "[consumeResultFeed] 当前序列号=$lastOperationSequence, 接收序列号=$operationSequence")
+        if (operationSequence != lastOperationSequence) {
+            // A new operation may have no NOTE yet. Drop old pending NOTEs now without
+            // interrupting current speech, touching final results, or resetting NOTE IDs.
+            resultSpeaker.clearPendingNotes()
+        }
+        lastOperationSequence = operationSequence // server restart may legitimately reset this to 0
+
+        val rawEvents = raw.optJSONArray("events") ?: return
+        val events = (0 until rawEvents.length()).map { index ->
+            rawEvents.optJSONObject(index)?.let { event ->
+                mapOf("id" to event.opt("id"), "operation" to event.opt("operation"),
+                    "modality" to event.opt("modality"), "success" to event.opt("success"))
+            }
+        }
+        val feed = mapOf("version" to raw.opt("version"), "stream_id" to raw.opt("stream_id"),
+            "oldest_id" to raw.opt("oldest_id"), "latest_id" to raw.opt("latest_id"), "events" to events)
+
+        // 处理 NOTE 事件
+        val rawNoteEvents = raw.optJSONArray("note_events") ?: org.json.JSONArray()
+        val noteEvents = (0 until rawNoteEvents.length()).mapNotNull { index ->
+            rawNoteEvents.optJSONObject(index)?.let { event ->
+                mapOf("id" to event.opt("id"), "nid" to event.opt("nid"),
+                    "status" to event.opt("status"), "message" to event.opt("message"),
+                    "operation_sequence" to event.opt("operation_sequence"))
+            }
+        }
+
+        val ready = resultSpeaker.ready
+        // Disabled/unready snapshots already advance both trackers. Becoming ready or
+        // enabling speech must retain that cursor so the next unseen finals can speak.
+        // Only first entry, stream changes and resume establish a silent baseline.
+        // Establish/reset the stream baseline before NOTE processing.
+        val unseen = resultTracker.consume(feed, resultSpeechEnabled && ready)
+        if (resultTracker.streamChanged) {
+            resultSpeaker.stop()
+            noteTracker.reset()
+        }
+        val notes = noteTracker.consume(noteEvents,
+            maySpeak = resultSpeechEnabled && ready && !resultTracker.streamChanged)
+        // Queue final results first: if both arrive in one snapshot and speech is idle,
+        // enqueueNotes must not start a NOTE before the snapshot's protected final results.
+        resultSpeaker.enqueue(unseen)
+        if (notes.isNotEmpty()) resultSpeaker.enqueueNotes(notes, replacePending = true)
     }
 
     private fun vibrateIfEnabled() {
@@ -182,14 +338,14 @@ class MainActivity : ComponentActivity() {
         })
         root.addView(modernButton("连接上次设备", Color.rgb(35, 112, 222)) {
             showMessage("正在连接…")
-            getStatus { value ->
-                if (value.optBoolean("paired", false)) showControls()
-                else {
+            getStatus({ value ->
+                if (isStatusSnapshot(value) && value.optBoolean("paired")) showControls()
+                else if (pairingExpired(value)) {
                     token = ""
                     connectionPrefs.edit().remove("token").apply()
                     showMessage("上次连接已失效，请重新扫码")
-                }
-            }
+                } else showMessage("连接失败，请检查电脑端服务后重试（配对信息已保留）")
+            })
         }, LinearLayout.LayoutParams(-1, dp(72)).apply { setMargins(0, 0, 0, dp(12)) })
         root.addView(modernButton("扫码连接新设备", Color.rgb(20, 145, 116)) {
             showScanner()
@@ -226,6 +382,7 @@ class MainActivity : ComponentActivity() {
             setTextColor(Color.rgb(23, 32, 42))
         })
         val preview = PreviewView(this)
+        scannerPreview = preview
         root.addView(preview, LinearLayout.LayoutParams(-1, 0, 1f))
         message = TextView(this)
         root.addView(message)
@@ -238,6 +395,7 @@ class MainActivity : ComponentActivity() {
     private fun scan(previewView: PreviewView) {
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
+            if (scannerPreview !== previewView) return@addListener
             val provider = providerFuture.get()
             val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
             val analysis = ImageAnalysis.Builder().setBackpressureStrategy(
@@ -251,7 +409,15 @@ class MainActivity : ComponentActivity() {
                         .addOnSuccessListener { codes ->
                             codes.firstOrNull()?.rawValue?.let { value ->
                                 if (value.startsWith("http://") || value.startsWith("https://")) {
-                                    runOnUiThread { provider.unbindAll(); pairFromUrl(value) }
+                                    runOnUiThread {
+                                        // Ignore duplicate/stale camera results while a pair is in flight
+                                        // or after navigation/pause. Only the current scanner may unbind.
+                                        if (foreground && scannerPreview === previewView &&
+                                            !pairingInProgress && !resumeScannerAfterPairCancellation) {
+                                            provider.unbindAll()
+                                            pairFromUrl(value)
+                                        }
+                                    }
                                 }
                             }
                         }.addOnCompleteListener { proxy.close() }
@@ -264,7 +430,8 @@ class MainActivity : ComponentActivity() {
 
     private fun pairFromUrl(value: String) {
         val uri = Uri.parse(value)
-        if (uri.scheme !in listOf("http", "https") || uri.host.isNullOrBlank() || uri.port <= 0) {
+        if (uri.scheme !in listOf("http", "https") || uri.host.isNullOrBlank() || uri.port !in 1..65535) {
+            showScanner()
             showMessage("二维码不是有效的capLG连接地址")
             return
         }
@@ -286,17 +453,30 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun pair(code: String) {
-        postJson("/api/pair", JSONObject().put("code", code)) { result ->
+        if (!foreground || pairingInProgress) return
+        pairingInProgress = true
+        showMessage("正在配对…")
+        postJson("/api/pair", JSONObject().put("code", code), onFailure = {
+            pairingInProgress = false
+            showPairInput()
+            showMessage("连接失败，请检查网络后重试或重新扫码")
+        }) { result ->
+            pairingInProgress = false
             if (result.optBoolean("ok")) {
                 token = result.optString("token")
                 persistConnection()
                 showControls()
-            } else showMessage(result.optString("message"))
+            } else {
+                showPairInput()
+                showMessage(result.optString("message"))
+            }
         }
     }
 
     private fun showControls() {
         stopPolling()
+        resultTracker.enterControls()
+        resultSpeaker.setActive(resultTracker.isActive && resultSpeechEnabled)
         root = baseLayout()
 
         // 图片预览区域（可折叠）
@@ -338,7 +518,7 @@ class MainActivity : ComponentActivity() {
             setMargins(dp(6), dp(6), dp(6), dp(6))
         })
 
-        val responseScroll = ScrollView(this).apply {
+        val responseScroll = ResponseScrollView(this).apply {
             background = rounded(Color.rgb(28, 42, 58), 16, Color.rgb(61, 82, 105))
             isFillViewport = true
             elevation = dp(2).toFloat()
@@ -356,16 +536,20 @@ class MainActivity : ComponentActivity() {
 
         val toBottom = modernButton("回到底部", Color.rgb(55, 78, 103)) {}
         toBottom.visibility = View.GONE
+        fun updateToBottom() {
+            toBottom.visibility = if (responseExpanded && !responseScroll.followingLatest) View.VISIBLE else View.GONE
+        }
+        responseScroll.onFollowingChanged = { updateToBottom() }
         toBottom.setOnClickListener {
-            responseScroll.post { responseScroll.fullScroll(View.FOCUS_DOWN) }
-            toBottom.visibility = View.GONE
+            responseScroll.followLatest()
+            updateToBottom()
         }
         root.addView(toBottom, LinearLayout.LayoutParams(-1, -2))
 
         responseButton.setOnClickListener {
             responseExpanded = !responseExpanded
             responseScroll.visibility = if (responseExpanded) View.VISIBLE else View.GONE
-            toBottom.visibility = if (responseExpanded) toBottom.visibility else View.GONE
+            updateToBottom()
             responseButton.text = if (responseExpanded) "▼ 模组响应" else "▶ 模组响应"
         }
 
@@ -526,34 +710,66 @@ class MainActivity : ComponentActivity() {
         }
         val poll = object : Runnable {
             override fun run() {
-                getStatus { value ->
-                    if (!value.optBoolean("paired", false)) {
+                val generation = resultTracker.generation
+                if (!resultTracker.accepts(generation) || pollingTask !== this || pollingCall != null) return
+                val waiting = !needsStatusSnapshot && supportsLongPoll && !waitEndpointUnavailable
+                fun schedule(delay: Long) {
+                    if (!resultTracker.accepts(generation) || pollingTask !== this) return
+                    response.removeCallbacks(this)
+                    response.postDelayed(this, delay)
+                }
+                val retry: () -> Unit = {
+                    // Network/parse failures keep pairing data and resume from a fresh snapshot.
+                    needsStatusSnapshot = true
+                    schedule(1000)
+                }
+                val consume: (JSONObject) -> Unit = consume@{ value ->
+                    if (!resultTracker.accepts(generation) || pollingTask !== this) return@consume
+                    if (waiting && value.optInt("http_status") == 404) {
+                        waitEndpointUnavailable = true
+                        supportsLongPoll = false
+                        needsStatusSnapshot = true
+                        schedule(0) // An old server's missing /api/wait is not invalid pairing.
+                        return@consume
+                    }
+                    if (pairingExpired(value)) {
                         token = ""
                         connectionPrefs.edit().remove("token").apply()
+                        // Navigate now rather than leaving a delayed transition that can
+                        // be invalidated by pause/resume and strand a non-polling controls page.
+                        showScanner()
                         showMessage("连接已失效，请重新扫码")
-                        response.postDelayed({ showScanner() }, 900)
-                        return@getStatus
+                        return@consume
                     }
+                    if (!isStatusSnapshot(value)) {
+                        retry()
+                        return@consume
+                    }
+                    consumeResultFeed(value)
                     supportsCustomAction = value.optBoolean("supports_custom_action", false)
                     renderPreview(value.optJSONObject("preview") ?: JSONObject())
                     val next = value.optString("response_text", "")
                     if (next != lastResponse) {
-                        val atBottom = responseScroll.scrollY + responseScroll.height >= response.height - dp(16)
                         response.text = if (next.isBlank()) "等待模组响应…" else next
                         lastResponse = next
-                        if (atBottom || lastResponse.isBlank()) {
-                            responseScroll.post { responseScroll.fullScroll(View.FOCUS_DOWN) }
-                            toBottom.visibility = View.GONE
-                        } else toBottom.visibility = View.VISIBLE
+                        if (next.isBlank()) responseScroll.followLatest()
+                        // 等新文本完成测量/布局后再定位，不使用会改变焦点的 fullScroll。
+                        responseScroll.requestLayout()
+                        updateToBottom()
                     }
                     currentStatus = "模组：${if (value.optBoolean("module_connected")) "已连接" else "未连接"}    协议：${value.optString("protocol_profile")}\n模式：${value.optString("operation_mode")}    服务器：$baseUrl"
-                    response.postDelayed(this, 300)
+                    // Commit only a snapshot actually consumed by this foreground/connection.
+                    updateStatusCursor(value)
+                    needsStatusSnapshot = false
+                    schedule(if (supportsLongPoll) 0 else 300)
                 }
+                if (waiting) waitForChange(consume, retry)
+                else getStatus(consume, retry, polling = true)
             }
         }
         pollingTask = poll
         pollingView = response
-        response.post(poll)
+        if (foreground) response.post(poll)
     }
 
     private fun loadCustomCommands(): MutableList<CustomCommand> {
@@ -818,6 +1034,38 @@ class MainActivity : ComponentActivity() {
             setMargins(0, 0, 0, dp(16))
         })
 
+        val speechRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = rounded(Color.rgb(245, 248, 252), 8, Color.rgb(210, 221, 232))
+        }
+        speechRow.addView(TextView(this).apply {
+            text = "注册/识别结果语音播报"
+            textSize = 15f
+            setTextColor(Color.rgb(23, 32, 42))
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        val speechStatus = TextView(this).apply {
+            text = if (resultSpeechEnabled) resultSpeaker.status else "语音播报已关闭"
+            textSize = 12f
+            setTextColor(Color.rgb(72, 86, 102))
+            setPadding(dp(12), dp(6), dp(12), dp(12))
+        }
+        speechRow.addView(android.widget.Switch(this).apply {
+            isChecked = resultSpeechEnabled
+            setOnCheckedChangeListener { _, enabled ->
+                // Keep the cursor advanced by disabled snapshots; do not silence the
+                // first batch of unseen results received after enabling speech.
+                settingsPrefs.edit().putBoolean("speak_final_results", enabled).apply()
+                resultSpeaker.setActive(resultTracker.isActive && enabled)
+                speechStatus.text = if (enabled) resultSpeaker.status else "语音播报已关闭"
+            }
+        })
+        dialogLayout.addView(speechRow, LinearLayout.LayoutParams(-1, -2))
+        dialogLayout.addView(speechStatus, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(8))
+        })
+
         val changeConnectionBtn = modernButton("更改连接", Color.rgb(35, 112, 222)) {
             showConnectionChoice()
         }
@@ -850,34 +1098,132 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun postJson(path: String, json: JSONObject, callback: (JSONObject) -> Unit) {
+    private fun postJson(
+        path: String,
+        json: JSONObject,
+        onFailure: () -> Unit = { showMessage("连接失败，请检查网络后重试") },
+        callback: (JSONObject) -> Unit
+    ) {
         val body = json.toString().toRequestBody("application/json".toMediaType())
         val builder = Request.Builder().url(baseUrl + path).post(body)
         if (token.isNotEmpty()) builder.addHeader("X-Remote-Token", token)
-        execute(builder.build(), callback)
+        execute(builder.build(), callback, onFailure)
     }
 
-    private fun getStatus(callback: (JSONObject) -> Unit) {
+    private fun getStatus(
+        callback: (JSONObject) -> Unit,
+        onFailure: () -> Unit = { showMessage("连接失败，请检查电脑端服务后重试（配对信息已保留）") },
+        polling: Boolean = false
+    ) {
         val builder = Request.Builder().url(baseUrl + "/api/status").get()
         if (token.isNotEmpty()) builder.addHeader("X-Remote-Token", token)
-        execute(builder.build(), callback)
+        execute(builder.build(), callback, onFailure, polling = polling)
     }
 
-    private fun execute(request: Request, callback: (JSONObject) -> Unit) {
-        executor.execute {
-            try {
-                client.newCall(request).execute().use { result ->
-                    val value = JSONObject(result.body?.string() ?: "{}")
-                    value.put("http_status", result.code)
-                    if (result.code == 404 && value.optString("message") == "路径不存在") {
-                        value.put("message", "电脑端版本过旧，请更新并重启远程服务（缺少自定义命令接口）")
-                    }
-                    runOnUiThread { callback(value) }
-                }
-            } catch (error: Exception) {
-                runOnUiThread { showMessage(error.message ?: "连接失败") }
+    private fun waitForChange(callback: (JSONObject) -> Unit, onFailure: () -> Unit) {
+        val builder = Request.Builder()
+            .url(baseUrl + "/api/wait")
+            .get()
+            .addHeader("X-Wait-Timeout", "25")
+        // No cursor means an immediate snapshot, not an invented operation-sequence cursor.
+        statusRevision?.let { builder.addHeader("X-Last-Seen-Revision", it.toString()) }
+        statusStreamId?.let { builder.addHeader("X-Status-Stream", it) }
+        if (token.isNotEmpty()) builder.addHeader("X-Remote-Token", token)
+        execute(builder.build(), callback, onFailure, polling = true, httpClient = waitClient)
+    }
+
+    private fun isStatusSnapshot(value: JSONObject): Boolean =
+        value.optInt("http_status") in 200..299 && value.opt("paired") is Boolean &&
+            value.opt("response_text") is String
+
+    private fun pairingExpired(value: JSONObject): Boolean {
+        val code = value.optInt("http_status")
+        return code == 401 || code == 403 || (code in 200..299 &&
+            (value.opt("paired") == false ||
+                (value.opt("ok") == false && value.optString("message") == "请先配对")))
+    }
+
+    private fun updateStatusCursor(value: JSONObject) {
+        val revision = when (val raw = value.opt("status_revision")) {
+            is Int -> raw.toLong()
+            is Long -> raw
+            else -> null
+        }?.takeIf { it >= 0 }
+        val stream = (value.opt("status_stream_id") as? String)?.takeIf { it.isNotBlank() }
+        statusRevision = revision
+        statusStreamId = stream
+        supportsLongPoll = !waitEndpointUnavailable && value.opt("supports_long_poll") == true &&
+            revision != null && stream != null
+    }
+
+    private fun execute(
+        request: Request,
+        callback: (JSONObject) -> Unit,
+        onFailure: () -> Unit = { showMessage("连接失败，请检查网络后重试") },
+        polling: Boolean = false,
+        httpClient: OkHttpClient = client
+    ) {
+        val generation = requestGeneration
+        val requestUrl = baseUrl
+        val requestToken = token
+        val trackerGeneration = resultTracker.generation
+        val task = pollingTask
+        val call = httpClient.newCall(request)
+        if (polling) {
+            if (pollingCall != null) return
+            pollingCall = call
+        } else pendingRequests.add(call)
+        val started = android.os.SystemClock.elapsedRealtime()
+        // Never log request headers, pairing codes, tokens, or response bodies.
+        val path = request.url.encodedPath
+        Log.d("capLGRemote", "request start ${request.method} $path")
+        fun deliver(value: JSONObject?) {
+            mainHandler.post {
+                // A cancelled old callback must not clear the replacement poll's Call.
+                val ownsPoll = !polling || pollingCall === call
+                if (polling && ownsPoll) pollingCall = null
+                if (!polling) pendingRequests.remove(call)
+                if (!ownsPoll || generation != requestGeneration || baseUrl != requestUrl ||
+                    token != requestToken || !foreground || isDestroyed || call.isCanceled()) return@post
+                if (polling && (pollingTask !== task || !resultTracker.accepts(trackerGeneration))) return@post
+                if (value != null) callback(value) else onFailure()
             }
         }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.d("capLGRemote", "request failed ${request.method} $path " +
+                    "elapsedMs=${android.os.SystemClock.elapsedRealtime() - started} " +
+                    "cancelled=${call.isCanceled()} type=${e.javaClass.simpleName}")
+                deliver(null)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                Log.d("capLGRemote", "request arrived ${request.method} $path " +
+                    "http=${response.code} elapsedMs=${android.os.SystemClock.elapsedRealtime() - started}")
+                val value = try {
+                    response.use { result ->
+                        val text = result.body?.string().orEmpty()
+                        val parsed = try {
+                            JSONObject(text)
+                        } catch (error: Exception) {
+                            // Missing endpoints may return HTML/empty responses: retain HTTP 404
+                            // so polling can fall back, rather than treating it as an auth failure.
+                            if (result.isSuccessful) throw error else JSONObject()
+                        }
+                        parsed.put("http_status", result.code)
+                        if (path == "/api/custom-action" && result.code == 404) {
+                            parsed.put("message", "电脑端版本过旧，请更新并重启远程服务（缺少自定义命令接口）")
+                        }
+                        parsed
+                    }
+                } catch (error: Exception) {
+                    Log.d("capLGRemote", "request unreadable ${request.method} $path " +
+                        "elapsedMs=${android.os.SystemClock.elapsedRealtime() - started} type=${error.javaClass.simpleName}")
+                    null
+                }
+                deliver(value)
+            }
+        })
     }
 
     private fun showMessage(text: String) {
@@ -886,6 +1232,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         stopPolling()
+        resultSpeaker.shutdown()
         executor.shutdownNow()
         super.onDestroy()
     }

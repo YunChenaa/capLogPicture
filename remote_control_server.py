@@ -1,10 +1,14 @@
 """局域网手机遥控服务：仅提供受控业务动作，不暴露原始串口命令。"""
 from __future__ import annotations
 
+from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
+import math
 import mimetypes
 import secrets
 import socket
@@ -27,6 +31,11 @@ REMOTE_ACTIONS = {
 MAX_BODY_BYTES = 16 * 1024
 SESSION_TTL_SECONDS = 8 * 60 * 60
 ACTION_COOLDOWN_SECONDS = 0.6
+# 有界重放窗口，覆盖一次1000次重复测试；不保证无限断网后的事件交付。
+RESULT_EVENT_CAPACITY = 1024
+NOTE_EVENT_CAPACITY = 32
+_LOG = logging.getLogger(__name__)
+_UNSPECIFIED_ORIGIN = object()  # Legacy callers omit provenance; explicit None is no stream.
 
 
 @dataclass
@@ -36,14 +45,95 @@ class RemoteSession:
     last_seen: float
 
 
+@dataclass(frozen=True)
+class RemoteOrigin:
+    stream_id: str
+    session_token: Optional[str] = None
+
+
+class RemoteActionRequest:
+    """Atomic queue acceptance, not physical cancellation of claimed serial work."""
+
+    def __init__(self, server=None, origin=None):
+        self.server = server
+        self.origin = origin
+        self._lock = threading.Lock()
+        self.done = threading.Event()
+        self.state = 'queued'
+        self.result = None
+
+    def claim(self):
+        if self.server is not None:
+            return self.server.claim_request(self)
+        with self._lock:
+            return self._claim_locked()
+
+    def _claim_locked(self):
+        if self.state != 'queued':
+            return False
+        self.state = 'claimed'
+        return True
+
+    def cancel(self, result):
+        """Only queued work can be cancelled; claimed wire work is irrevocable."""
+        with self._lock:
+            if self.state != 'queued':
+                return False
+            self.result = dict(result)
+            self.state = 'cancelled'
+            self.done.set()
+            return True
+
+    def complete(self, result):
+        with self._lock:
+            # Late callbacks cannot resurrect cancellation or rewrite a final result.
+            if self.state != 'claimed':
+                return False
+            self.result = dict(result)
+            self.state = 'completed'
+            self.done.set()
+        if self.server is not None and hasattr(self, 'action_name'):
+            self.server._record_action_response(self, self.result)
+        return True
+
+    def wait(self, timeout):
+        self.done.wait(timeout)
+        with self._lock:
+            if self.state == 'queued':
+                self.state = 'cancelled'
+                self.result = {'ok': False, 'state': 'cancelled',
+                               'message': '主界面忙，排队操作已取消，未执行'}
+                self.done.set()
+            if self.state == 'claimed':
+                return {'ok': True, 'state': 'in_progress',
+                        'message': '操作已开始，结果尚未确定，请勿重试'}
+            return dict(self.result)
+
+    def pending(self):
+        with self._lock:
+            return self.state in ('queued', 'claimed')
+
+
+class RemoteActionArgument(str):
+    """String-compatible second callback argument, including custom JSON."""
+
+    def __new__(cls, value, request):
+        argument = super().__new__(cls, value)
+        argument.request = request
+        return argument
+
+
 class RemoteControlServer:
     """线程化HTTP服务器，HTTP线程只发出动作回调，不触碰Qt对象。"""
 
     def __init__(self, action_callback: Callable[[str, str], object],
                  status_provider: Optional[Callable[[], dict]] = None,
-                 host='0.0.0.0', port=0):
+                 host='0.0.0.0', port=0, *, queued_action_callback=False):
         self.action_callback = action_callback
+        # Legacy callbacks execute synchronously; queue adapters claim at dequeue.
+        self.queued_action_callback = queued_action_callback
         self.status_provider = status_provider or (lambda: {})
+        self._status_snapshot = None  # None保留旧provider API；显式发布后只读缓存
         self.host = host
         self.port = port
         self.pair_code = ''
@@ -53,6 +143,14 @@ class RemoteControlServer:
         self._server = None
         self._thread = None
         self._started = False
+        self._result_stream_id = None
+        self._latest_result_id = 0
+        self._result_events = deque(maxlen=RESULT_EVENT_CAPACITY)
+        self._latest_note_id = 0
+        self._note_events = {}  # {(nid, status): event_dict}
+        self._operation_sequence = 0  # 每次新操作递增
+        self._status_changed = threading.Condition(self._lock)
+        self._status_revision = 0  # 状态游标，与操作序列号无关；仅新stream启动时重置
         self.response_text = ''
         self.preview = {'version': 0, 'display_name': '', 'items': []}
         self._preview_files = {}
@@ -116,7 +214,9 @@ class RemoteControlServer:
                 self.send_response(204)
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-                self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Remote-Token')
+                self.send_header('Access-Control-Allow-Headers',
+                                 'Content-Type, X-Remote-Token, X-Wait-Timeout, '
+                                 'X-Last-Seen-Revision, X-Status-Stream, X-Last-Seen-Sequence')
                 self.end_headers()
 
             def do_GET(self):
@@ -125,6 +225,19 @@ class RemoteControlServer:
                     self._send(200, REMOTE_PAGE, 'text/html; charset=utf-8')
                 elif path == '/api/status':
                     self._send(200, owner.status_payload(self.headers.get('X-Remote-Token')))
+                elif path == '/api/wait':
+                    # 旧操作序号不是状态游标；缺少revision的旧客户端立即获得快照。
+                    try:
+                        payload = owner.wait_for_change(
+                            self.headers.get('X-Remote-Token'),
+                            self.headers.get('X-Wait-Timeout', '25'),
+                            self.headers.get('X-Last-Seen-Revision'),
+                            self.headers.get('X-Status-Stream'),
+                        )
+                    except (ValueError, TypeError) as exc:
+                        self._send(400, {'ok': False, 'message': str(exc)})
+                        return
+                    self._send(200, payload)
                 elif path.startswith('/api/preview/'):
                     item_id = path.rsplit('/', 1)[-1]
                     result = owner.preview_file(self.headers.get('X-Remote-Token'), item_id)
@@ -170,16 +283,30 @@ class RemoteControlServer:
             name='capLG-remote-http',
             daemon=True,
         )
-        self._started = True
+        with self._lock:
+            self._result_stream_id = secrets.token_urlsafe(18)
+            self._latest_result_id = 0
+            self._result_events.clear()
+            self._latest_note_id = 0
+            self._note_events.clear()
+            self._operation_sequence = 0
+            self._status_revision = 0
+            self._started = True
+            self._notify_status_changed_locked()
         self._thread.start()
         return self.connection_info()
 
     def stop(self):
-        server, thread = self._server, self._thread
-        self._server = None
-        self._thread = None
-        self._started = False
         with self._lock:
+            server, thread = self._server, self._thread
+            self._server = None
+            self._thread = None
+            self._started = False
+            self._result_stream_id = None
+            self._latest_result_id = 0
+            self._result_events.clear()
+            self._latest_note_id = 0
+            self._note_events.clear()
             self._session = None
             self.pair_code = ''
             self._last_action_at.clear()
@@ -189,15 +316,130 @@ class RemoteControlServer:
                 'ok': True, 'message': '远程控制已停止',
                 'action': None, 'updated_at': _now_text(),
             }
+            self._notify_status_changed_locked()
         if server:
             server.shutdown()
             server.server_close()
         if thread and thread is not threading.current_thread():
             thread.join(timeout=2)
 
+    def capture_origin(self):
+        """Local submissions also remember a stopped/no-server stream as None."""
+        with self._lock:
+            return RemoteOrigin(self._result_stream_id) if self.started else None
+
+    def _origin_valid_locked(self, origin):
+        return (origin is not None and self.started
+                and self._result_stream_id == origin.stream_id
+                and (origin.session_token is None
+                     or self._authorized(origin.session_token)))
+
+    def claim_request(self, request):
+        # Validation and queued->claimed are one acceptance point. Never keep
+        # this lock while executing Qt callbacks or writing/flushing serial.
+        with self._lock, request._lock:
+            if request.state != 'queued':
+                return False
+            if not self._origin_valid_locked(request.origin):
+                request.state = 'cancelled'
+                request.result = {'ok': False, 'state': 'cancelled',
+                                  'message': '原远程会话已失效，操作未执行'}
+                request.done.set()
+                return False
+            return request._claim_locked()
+
+    def origin_valid(self, origin):
+        with self._lock:
+            return self._origin_valid_locked(origin)
+
+    def publish_result(self, operation, modality, success, *, origin=_UNSPECIFIED_ORIGIN):
+        """发布注册/识别的最终结论，不携带模组回复或用户身份信息。"""
+        with self._lock:
+            if not self.started or (origin is not _UNSPECIFIED_ORIGIN
+                                    and not self._origin_valid_locked(origin)):
+                return
+            if operation not in ('register', 'recognize'):
+                raise ValueError('结果操作必须是register或recognize')
+            if modality not in ('face', 'palm'):
+                raise ValueError('结果类型必须是face或palm')
+            if not isinstance(success, bool):
+                raise TypeError('结果success必须是bool')
+            self._latest_result_id += 1
+            self._result_events.append({
+                'id': self._latest_result_id,
+                'operation': operation,
+                'modality': modality,
+                'success': success,
+                'message': ('人脸' if modality == 'face' else '手掌')
+                           + ('注册' if operation == 'register' else '识别')
+                           + ('成功' if success else '失败'),
+            })
+            self._notify_status_changed_locked()
+            _LOG.debug('Remote result id=%s operation=%s modality=%s success=%s',
+                       self._latest_result_id, operation, modality, success)
+
+    def publish_note(self, nid, status, message, *, origin=_UNSPECIFIED_ORIGIN):
+        """发布 NOTE 状态消息，相同 (nid, status) 只保留最新的一条。"""
+        with self._lock:
+            if not self.started or (origin is not _UNSPECIFIED_ORIGIN
+                                    and not self._origin_valid_locked(origin)):
+                return
+            if not isinstance(nid, int) or not isinstance(status, int):
+                raise TypeError('nid 和 status 必须是整数')
+            if not isinstance(message, str):
+                raise TypeError('message 必须是字符串')
+
+            # 使用 (nid, status) 作为去重键
+            key = (nid, status)
+            self._latest_note_id += 1
+            self._note_events[key] = {
+                'id': self._latest_note_id,
+                'nid': nid,
+                'status': status,
+                'message': message,
+                'operation_sequence': self._operation_sequence,
+            }
+
+            # 限制容量：保留最新的 NOTE_EVENT_CAPACITY 条
+            if len(self._note_events) > NOTE_EVENT_CAPACITY:
+                # 按 id 排序，删除最旧的
+                oldest_key = min(self._note_events.keys(),
+                                key=lambda k: self._note_events[k]['id'])
+                del self._note_events[oldest_key]
+
+            self._notify_status_changed_locked()
+            _LOG.debug('remote note id=%d nid=%d status=%d operation_sequence=%d',
+                       self._latest_note_id, nid, status, self._operation_sequence)
+
+    def new_operation(self, *, origin=_UNSPECIFIED_ORIGIN):
+        """标记新操作开始，递增序列号并清空 NOTE"""
+        with self._lock:
+            if not self.started or (origin is not _UNSPECIFIED_ORIGIN
+                                    and not self._origin_valid_locked(origin)):
+                return
+            self._operation_sequence += 1
+            self._note_events.clear()
+            self._notify_status_changed_locked()
+            _LOG.debug('remote operation_sequence=%d', self._operation_sequence)
+
+    def set_status_snapshot(self, status):
+        """业务线程主动发布快照；缓存及revision在同一锁内更新。
+
+        第一次调用切换为缓存模式，此后HTTP线程不再调用status_provider。
+        调用方及响应接收方均不能修改内部快照。
+        """
+        snapshot = deepcopy(dict(status or {}))
+        with self._lock:
+            if self._status_snapshot != snapshot:
+                self._status_snapshot = snapshot
+                self._notify_status_changed_locked()
+
     def set_response_text(self, text):
         with self._lock:
-            self.response_text = str(text or '')[-20000:]
+            text = str(text or '')[-20000:]
+            if self.response_text != text:
+                self.response_text = text
+                self._notify_status_changed_locked()
 
     def set_preview_items(self, items, display_name=''):
         metadata = []
@@ -223,6 +465,7 @@ class RemoteControlServer:
                 'items': metadata,
             }
             self._preview_files = files
+            self._notify_status_changed_locked()
 
     def clear_preview(self):
         self.set_preview_items([])
@@ -246,57 +489,128 @@ class RemoteControlServer:
                         if self.started else [],
         }
 
+    def _notify_status_changed_locked(self):
+        """调用者持有共享RLock：版本递增与广播是一次原子状态发布。"""
+        self._status_revision += 1
+        self._status_changed.notify_all()
+
     def pair(self, code):
-        if not self.started:
-            return {'ok': False, 'message': '远程服务未启动'}
-        if not secrets.compare_digest(code, self.pair_code):
-            return {'ok': False, 'message': '配对码错误'}
-        now = time.monotonic()
-        token = secrets.token_urlsafe(24)
         with self._lock:
+            if not self.started:
+                return {'ok': False, 'message': '远程服务未启动'}
+            if not secrets.compare_digest(code, self.pair_code):
+                return {'ok': False, 'message': '配对码错误'}
+            now = time.monotonic()
+            token = secrets.token_urlsafe(24)
             self._session = RemoteSession(token, now, now)
+            self._notify_status_changed_locked()
         return {'ok': True, 'token': token, 'message': '配对成功'}
 
     def _authorized(self, token):
-        now = time.monotonic()
         with self._lock:
+            now = time.monotonic()
             session = self._session
-            if not session or not token or not secrets.compare_digest(token, session.token):
-                return False
-            if now - session.last_seen > SESSION_TTL_SECONDS:
+            if session and now - session.last_seen > SESSION_TTL_SECONDS:
                 self._session = None
+                self._notify_status_changed_locked()
+                return False
+            if not session or not token or not secrets.compare_digest(token, session.token):
                 return False
             session.last_seen = now
             return True
 
     def status_payload(self, token=None):
-        status = dict(self.status_provider() or {})
+        # 旧provider兼容路径不能持有服务器锁；动态业务应主动发布缓存。
         with self._lock:
-            paired = bool(self._session and self._authorized(token))
-            result = dict(self.last_result)
-        status.update({
-            'ok': True,
-            'api_version': 2,
-            'supports_custom_action': True,
-            'started': self.started,
-            'paired': paired,
-            'actions': REMOTE_ACTIONS,
-            'response_text': self.response_text,
-            'preview': self.preview,
-            'last_result': result,
-        })
+            use_provider = self._status_snapshot is None
+        legacy_status = dict(self.status_provider() or {}) if use_provider else {}
+        with self._lock:
+            # 再次检查：provider运行期间可能已经切换为缓存模式。
+            status = (deepcopy(self._status_snapshot) if self._status_snapshot is not None
+                      else legacy_status)
+            paired = self._authorized(token)
+            result_feed = None
+            if paired and self.started:
+                note_events_list = sorted(self._note_events.values(), key=lambda e: e['id'])
+                result_feed = {
+                    'version': 1,
+                    'stream_id': self._result_stream_id,
+                    'operation_sequence': self._operation_sequence,
+                    'oldest_id': (self._result_events[0]['id'] if self._result_events
+                                  else self._latest_result_id + 1),
+                    'latest_id': self._latest_result_id,
+                    'events': [dict(event) for event in self._result_events],
+                    'note_events': [dict(event) for event in note_events_list],
+                }
+            status.update({
+                'ok': True,
+                'api_version': 2,
+                'supports_custom_action': True,
+                'supports_result_events': True,
+                'supports_long_poll': True,
+                'status_revision': self._status_revision,
+                'status_stream_id': self._result_stream_id,
+                'result_feed': result_feed,
+                'started': self.started,
+                'paired': paired,
+                'actions': dict(REMOTE_ACTIONS),
+                'response_text': self.response_text,
+                'preview': {
+                    **self.preview,
+                    'items': [dict(item) for item in self.preview['items']],
+                },
+                'last_result': dict(self.last_result),
+            })
         return status
 
+    def wait_for_change(self, token=None, timeout=25, last_seen_revision=None,
+                        status_stream_id=None):
+        """按stream+revision等待，兼容没有状态游标的客户端（立即返回快照）。"""
+        try:
+            timeout = float(timeout)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError('等待超时必须是0到30秒的有限数值') from exc
+        if not math.isfinite(timeout) or not 0 <= timeout <= 30:
+            raise ValueError('等待超时必须是0到30秒的有限数值')
+        if last_seen_revision is not None:
+            if isinstance(last_seen_revision, str):
+                if (not last_seen_revision
+                        or any(char not in '0123456789' for char in last_seen_revision)):
+                    raise ValueError('状态revision必须是非负整数')
+                last_seen_revision = int(last_seen_revision)
+            elif type(last_seen_revision) is not int or last_seen_revision < 0:
+                raise ValueError('状态revision必须是非负整数')
+
+        deadline = time.monotonic() + timeout
+        with self._status_changed:
+            if not self._authorized(token):
+                return {'ok': False, 'message': '请先配对'}
+            # 谓词检查与Condition.wait共享RLock，避免检查和等待之间丢失通知。
+            # revision使用不等而非大于：过期/未来游标也必须立即重新同步。
+            while (last_seen_revision is not None and self.started
+                   and self._session is not None and self._session.token == token
+                   and self._status_revision == last_seen_revision
+                   and self._result_stream_id == status_stream_id):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._status_changed.wait(remaining)
+        # 缓存业务状态与revision同锁快照；旧provider仍仅在锁外调用。
+        return self.status_payload(token)
+
     def unpair(self, token):
-        if not self._authorized(token):
-            return {'ok': False, 'message': '未授权'}
         with self._lock:
+            if not self._authorized(token):
+                return {'ok': False, 'message': '未授权'}
             self._session = None
+            self._notify_status_changed_locked()
         return {'ok': True, 'message': '已解除配对'}
 
     def custom_action(self, token, name, hex_text):
-        if not self._authorized(token):
-            return {'ok': False, 'message': '请先配对'}
+        with self._lock:
+            if not self._authorized(token):
+                return {'ok': False, 'message': '请先配对'}
+            origin = RemoteOrigin(self._result_stream_id, token)
         name = name.strip()
         compact = ''.join(hex_text.replace(',', ' ').replace('-', ' ').split()).upper()
         if not name or len(name) > 32:
@@ -306,33 +620,74 @@ class RemoteControlServer:
             return {'ok': False, 'message': '请输入有效的偶数字节十六进制命令'}
         if len(compact) > 4096 or not compact.startswith('EFAA') or len(compact) < 12:
             return {'ok': False, 'message': '完整帧必须以EF AA开头，长度为6到2048字节'}
-        return self.action_callback('__custom__', json.dumps({
+        return self._execute_action('__custom__', json.dumps({
             'name': name, 'hex': compact
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), origin)
 
     def action(self, token, action_name):
-        if not self._authorized(token):
-            return {'ok': False, 'message': '请先配对'}
-        if action_name not in REMOTE_ACTIONS:
-            return {'ok': False, 'message': '不支持的远程操作'}
-        now = time.monotonic()
         with self._lock:
+            if not self._authorized(token):
+                return {'ok': False, 'message': '请先配对'}
+            if action_name not in REMOTE_ACTIONS:
+                return {'ok': False, 'message': '不支持的远程操作'}
+            now = time.monotonic()
             previous = self._last_action_at.get(action_name, 0)
             if now - previous < ACTION_COOLDOWN_SECONDS:
                 return {'ok': False, 'message': '操作过于频繁，请稍后再试'}
             self._last_action_at[action_name] = now
-        try:
-            result = self.action_callback(action_name, token)
-            if isinstance(result, dict):
-                response = dict(result)
+            origin = RemoteOrigin(self._result_stream_id, token)
+        return self._execute_action(action_name, token, origin)
+
+    def _record_action_response(self, request, response):
+        with self._lock:
+            if self._origin_valid_locked(request.origin):
+                # Terminal state is authoritative, even if a delayed callback returns
+                # an earlier in_progress snapshot (or tries to resurrect cancellation).
+                with request._lock:
+                    if request.state in ('completed', 'cancelled'):
+                        response = request.result
+                response = dict(response)
+                response.setdefault('action', request.action_name)
+                response.setdefault('updated_at', _now_text())
+                if self.last_result != response:
+                    self.last_result = response
+                    self._notify_status_changed_locked()
+
+    def _execute_action(self, action_name, argument, origin):
+        request = RemoteActionRequest(self, origin)
+        request.action_name = action_name
+        # String-compatible metadata preserves the two-argument callback and custom JSON.
+        argument = RemoteActionArgument(argument, request)
+        if self.queued_action_callback:
+            # Recheck before dispatch too: authentication may predate a restart.
+            # The adapter must still claim atomically when its queue is consumed.
+            if not self.origin_valid(origin):
+                request.cancel({'ok': False, 'state': 'cancelled',
+                                'message': '原远程会话已失效，操作未执行'})
+        else:
+            # Compatibility callbacks have no dequeue stage: claim before invoking
+            # them, without holding the server lock across their side effects.
+            request.claim()
+        if request.pending():
+            try:
+                result = self.action_callback(action_name, argument)
+                if isinstance(result, dict):
+                    response = dict(result)
+                else:
+                    response = {'ok': bool(result),
+                                'message': '操作已发送' if result else '操作被拒绝'}
+            except Exception as exc:
+                response = {'ok': False, 'message': f'执行失败：{exc}'}
+            if self.queued_action_callback:
+                # An adapter returning before dequeue cannot leave executable work
+                # behind a rejection. Claimed work remains explicitly in progress.
+                request.cancel({**response, 'ok': False, 'state': 'cancelled'})
             else:
-                response = {'ok': bool(result), 'message': '操作已发送' if result else '操作被拒绝'}
-        except Exception as exc:
-            response = {'ok': False, 'message': f'执行失败：{exc}'}
+                request.complete(response)
+        response = request.wait(0)
         response.setdefault('action', action_name)
         response.setdefault('updated_at', _now_text())
-        with self._lock:
-            self.last_result = response
+        self._record_action_response(request, response)
         return response
 
 

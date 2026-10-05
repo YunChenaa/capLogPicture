@@ -38,7 +38,10 @@ from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QSize, QEvent, 
 from PySide6.QtGui import QFont, QTextCursor, QPalette, QColor, QPixmap, QImage, QTextDocument, QShortcut, QKeySequence, QTransform, QTextCharFormat, QIcon, QActionGroup, QTextBlockUserData
 
 import theme_icons_rc  # 注册内嵌图标，源码运行和打包后均不依赖外部图片路径
-from remote_control_server import REMOTE_ACTIONS, RemoteControlServer
+from remote_control_server import (REMOTE_ACTIONS, RemoteControlServer,
+                                   RemoteActionRequest, RemoteOrigin)
+
+_MISSING_REMOTE_ORIGIN = object()
 from qr_code import generate_qr_image
 
 from datetime import datetime
@@ -2537,8 +2540,9 @@ class MainWindow(QMainWindow):
         # 手机热点局域网遥控服务，默认关闭。
         self.remote_action_signal.connect(self._execute_remote_action)
         self.remote_control_server = RemoteControlServer(
-            self._queue_remote_action, self.remote_status_snapshot
-        )
+            self._queue_remote_action, queued_action_callback=True)
+        # 在UI建成前启用缓存，HTTP线程从不读取Qt业务字段。
+        MainWindow.publish_remote_status_snapshot(self)
         self.remote_control_server.set_response_text('')
         self.remote_control_menu = None
         self.action_remote_toggle = None
@@ -2548,6 +2552,12 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         self.setup_signals()
         self.load_saved_config()
+
+        MainWindow.publish_remote_status_snapshot(self)
+        # 低频主线程兜底：无日志/未经过显式hook的连接或busy变更最迟下次tick同步。
+        self.remote_status_timer = QTimer(self)
+        self.remote_status_timer.timeout.connect(self.publish_remote_status_snapshot)
+        self.remote_status_timer.start(500)
 
         # 强制应用浅色主题（确保跨系统一致性）
         if not self.dark_mode:
@@ -3510,28 +3520,86 @@ class MainWindow(QMainWindow):
         self.escape_shortcut.activated.connect(self.hide_search_bar)
 
     def remote_status_snapshot(self):
-        """提供给HTTP线程的无控件状态快照。"""
+        """只在Qt主线程采集业务状态；初始化期间菜单可能尚未创建。"""
+        face_action = getattr(self, 'operation_mode_actions', {}).get('face')
+        modality = 'face' if face_action is None or face_action.isChecked() else 'palm'
         return {
-            'module_connected': bool(self.module_connected),
-            'protocol_profile': self.get_protocol_profile_name(),
-            'operation_mode': '人脸' if self.current_operation_modality() == 'face' else '手掌',
-            'busy': bool(self.protocol_change_locked()),
-            'response_text': self.remote_response_snapshot[-20000:],
+            'module_connected': bool(getattr(self, 'module_connected', False)),
+            'protocol_profile': protocol_defs.profile_name(
+                getattr(self, 'active_protocol_profile_id', protocol_defs.PROFILE_DSM),
+                getattr(self, 'protocol_profiles', [])),
+            'operation_mode': '人脸' if modality == 'face' else '手掌',
+            'busy': MainWindow.protocol_change_locked(self),
         }
 
-    def _queue_remote_action(self, action_name, session_token):
-        """HTTP线程只排队信号；真正动作在Qt主线程执行。"""
-        result = {'ok': False, 'message': '操作尚未执行'}
-        done = threading.Event()
-        self.remote_action_signal.emit(action_name, session_token, (result, done))
-        if not done.wait(2):
-            return {'ok': False, 'message': '主界面忙，操作未及时执行'}
-        return result
+    def publish_remote_status_snapshot(self):
+        """主动发布一致的业务快照；HTTP线程只读server锁保护的缓存。"""
+        server = getattr(self, 'remote_control_server', None)
+        if server is None:
+            return
+        if isinstance(self, QObject) and QThread.currentThread() != self.thread():
+            # 不从工作线程读取QAction；遗漏的状态由主线程timer兜底。
+            return
+        server.set_status_snapshot(MainWindow.remote_status_snapshot(self))
 
-    def _execute_remote_action(self, action_name, session_token, completion):
-        result, done = completion
-        result.update(self.handle_remote_action(action_name, session_token))
-        done.set()
+    def _queue_remote_action(self, action_name, session_token):
+        """Queue authenticated provenance without recapturing it after restart."""
+        request = getattr(session_token, 'request', None)
+        if not isinstance(request, RemoteActionRequest):
+            return {'ok': False, 'message': '远程请求缺少来源，操作未执行'}
+        self.remote_action_signal.emit(action_name, str(session_token), request)
+        return request.wait(2)
+
+    def _execute_remote_action(self, action_name, session_token, request):
+        if not request.claim():
+            return
+        previous = getattr(self, '_remote_action_origin', _MISSING_REMOTE_ORIGIN)
+        self._remote_action_origin = request.origin
+        self._remote_send_failed = False
+        try:
+            result = self.handle_remote_action(action_name, session_token)
+            if self._remote_send_failed:
+                result = {'ok': False, 'message': '指令发送失败，任务已停止'}
+        except Exception as error:
+            MainWindow._abort_repeated_tasks(self)
+            result = {'ok': False, 'message': f'执行失败：{error}'}
+        finally:
+            self._remote_action_origin = previous
+            MainWindow.publish_remote_status_snapshot(self)
+        request.complete(result)
+
+    def _submission_remote_origin(self):
+        origin = getattr(self, '_remote_action_origin', _MISSING_REMOTE_ORIGIN)
+        if origin is not _MISSING_REMOTE_ORIGIN:
+            return origin
+        if getattr(self, 'repeat_mode', False):
+            origin = getattr(self, 'repeat_origin', _MISSING_REMOTE_ORIGIN)
+            if origin is not _MISSING_REMOTE_ORIGIN:
+                return origin
+        server = getattr(self, 'remote_control_server', None)
+        if isinstance(server, RemoteControlServer):
+            return server.capture_origin()
+        return None if server is None else _MISSING_REMOTE_ORIGIN
+
+    def _abort_repeated_tasks(self):
+        """Release repeat/sequence busy state on failure or disconnect."""
+        self.repeat_mode = False
+        self.repeat_current = 0
+        self.repeat_total = 1
+        self.repeat_command = None
+        self.repeat_origin = _MISSING_REMOTE_ORIGIN
+        self.repeat_success_count = 0
+        self.repeat_reply_received = False
+        self.pending_command = None
+        for name in ('command_timeout_timer', 'retry_timer'):
+            timer = getattr(self, name, None)
+            if timer:
+                timer.stop()
+        if getattr(self, 'sequence_running', False):
+            MainWindow.stop_sequence(self)
+        if not getattr(self, 'is_downloading', False) and not getattr(self, 'ota_in_progress', False):
+            self.protocol_task_profile_id = None
+        MainWindow.publish_remote_status_snapshot(self)
 
     def handle_remote_action(self, action_name, session_token=''):
         """在Qt主线程执行白名单远程动作。"""
@@ -3544,8 +3612,8 @@ class MainWindow(QMainWindow):
                 return {'ok': False, 'message': '自定义命令格式无效'}
             if not self.module_connected:
                 return {'ok': False, 'message': '模组未连接'}
-            if self.ota_in_progress or self.is_downloading:
-                return {'ok': False, 'message': '当前正在下载或OTA，暂不能执行'}
+            if self.protocol_change_locked():
+                return {'ok': False, 'message': '当前已有任务运行中'}
             if not self.send_custom_raw_packet(packet):
                 return {'ok': False, 'message': '自定义命令发送失败'}
             hex_text = ' '.join(f'{value:02X}' for value in packet)
@@ -3569,8 +3637,8 @@ class MainWindow(QMainWindow):
         if action_name in ('download_jpeg', 'download_raw'):
             if self.protocol_change_locked():
                 return {'ok': False, 'message': '当前已有任务运行中'}
-        elif self.ota_in_progress or self.is_downloading:
-            return {'ok': False, 'message': '当前正在下载或OTA，暂不能执行'}
+        elif self.protocol_change_locked():
+            return {'ok': False, 'message': '当前已有任务运行中'}
         try:
             callback()
             self.append_module_log(f'[远程控制] 已请求：{REMOTE_ACTIONS[action_name]}')
@@ -3587,6 +3655,7 @@ class MainWindow(QMainWindow):
             self.append_module_log('[远程控制] 服务已停止')
             return
         try:
+            MainWindow.publish_remote_status_snapshot(self)
             info = self.remote_control_server.start()
             self.action_remote_toggle.setText('关闭远程控制')
             self.action_remote_info.setEnabled(True)
@@ -3678,6 +3747,9 @@ class MainWindow(QMainWindow):
         """清空模组响应信息显示"""
         self.module_response_text.clear()
         self.remote_response_snapshot = ''
+        server = getattr(self, 'remote_control_server', None)
+        if server and server.started:
+            server.set_response_text('')
         print('[调试] 已清空模组响应信息显示')
 
     def _add_exclusive_mode_menu(self, title, items, checked_key):
@@ -3795,7 +3867,9 @@ class MainWindow(QMainWindow):
         }
 
     def protocol_change_locked(self):
-        return bool(self.repeat_mode or self.sequence_running or self.is_downloading
+        return bool(getattr(self, 'repeat_mode', False)
+                    or getattr(self, 'sequence_running', False)
+                    or getattr(self, 'is_downloading', False)
                     or getattr(self, 'download_perf', None)
                     or getattr(self, 'ota_in_progress', False))
 
@@ -3868,6 +3942,7 @@ class MainWindow(QMainWindow):
                    f'{stop} · {self.repeat_count_spin.value()}次')
         self.btn_module_modes.setToolTip(summary)
         self.btn_module_modes.setAccessibleDescription(summary)
+        MainWindow.publish_remote_status_snapshot(self)
 
     def on_raw_mode_changed(self, action=None):
         """RAW模式切换"""
@@ -4130,6 +4205,15 @@ class MainWindow(QMainWindow):
         if not self.repeat_mode:
             return
 
+        origin = getattr(self, 'repeat_origin', _MISSING_REMOTE_ORIGIN)
+        if isinstance(origin, RemoteOrigin) and origin.session_token is not None:
+            server = getattr(self, 'remote_control_server', None)
+            # Acceptance of a future iteration does not revoke already claimed wire work.
+            if not server or not RemoteActionRequest(server, origin).claim():
+                self.append_module_log('[重复执行] 原远程会话已失效，停止后续执行', error=True)
+                MainWindow._abort_repeated_tasks(self)
+                return
+
         # 防止同一次操作多次Reply触发
         if self.repeat_reply_received:
             return
@@ -4162,11 +4246,13 @@ class MainWindow(QMainWindow):
             self.repeat_current = 0
             self.repeat_total = 1
             self.repeat_command = None
+            self.repeat_origin = _MISSING_REMOTE_ORIGIN
             self.repeat_success_count = 0
             self.repeat_reply_received = False
             if not self.sequence_running and not self.is_downloading \
                     and not getattr(self, 'ota_in_progress', False):
                 self.protocol_task_profile_id = None
+            MainWindow.publish_remote_status_snapshot(self)
             return
 
         # 检查是否还有剩余次数
@@ -4188,11 +4274,23 @@ class MainWindow(QMainWindow):
             self.repeat_current = 0
             self.repeat_total = 1
             self.repeat_command = None
+            self.repeat_origin = _MISSING_REMOTE_ORIGIN
             self.repeat_success_count = 0
             self.repeat_reply_received = False
             if not self.sequence_running and not self.is_downloading \
                     and not getattr(self, 'ota_in_progress', False):
                 self.protocol_task_profile_id = None
+            MainWindow.publish_remote_status_snapshot(self)
+
+    def _complete_repeat_operation(self, operation_type, success):
+        """A sequence step owns the whole repeat, not its first wire reply."""
+        if self.repeat_mode and success:
+            self.repeat_success_count += 1
+        self.check_repeat_next(last_success=success)
+        # A continuation may have submitted another iteration, or aborted the
+        # sequence on send failure. Only a completed subtask advances its parent.
+        if not self.repeat_mode:
+            self.check_sequence_next(operation_type)
 
     def toggle_command_panel(self):
         """折叠/展开更多指令面板"""
@@ -6358,15 +6456,28 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, '连接失败', f'无法连接到模组串口:\n{e}')
             self.module_serial = None
             self.module_connected = False
+        finally:
+            MainWindow.publish_remote_status_snapshot(self)
 
     def disconnect_module(self):
         """断开模组串口"""
+        MainWindow._abort_repeated_tasks(self)
+        self.pending_command = None
+        for name in ('command_timeout_timer', 'retry_timer'):
+            timer = getattr(self, name, None)
+            if timer:
+                timer.stop()
         try:
-            if self.module_serial:
-                self.module_serial.close()
-                self.module_serial = None
-
+            # A failing driver close must not skip logical disconnect/cleanup.
+            connection = self.module_serial
+            self.module_serial = None
             self.module_connected = False
+            if connection:
+                try:
+                    connection.close()
+                except Exception as error:
+                    self.append_module_log(f'[模组] 关闭串口失败: {error}', error=True)
+
             if hasattr(self, 'command_contexts'):
                 self.command_contexts.clear()
             self.active_command_context = None
@@ -6420,6 +6531,8 @@ class MainWindow(QMainWindow):
 
         except Exception as e:
             print(f'[模组] 断开连接失败: {e}')
+        finally:
+            MainWindow.publish_remote_status_snapshot(self)
 
     def module_receive_worker(self):
         """模组串口接收线程（优化版 - 使用阻塞读取）"""
@@ -6554,7 +6667,9 @@ class MainWindow(QMainWindow):
                     _, data = response
                     # if not self.is_downloading:
                     #     print(f'[调试-Note] data长度={len(data)}, 前4字节={data[:4].hex().upper() if len(data) >= 4 else data.hex().upper()}')
-                    self.module_response_signal.emit('note', ('note', 0, data))
+                    context = getattr(self, 'active_command_context', None)
+                    context = dict(context) if context else {'remote_origin': None}
+                    self.module_response_signal.emit('note', ('note', 0, data, context))
                 elif response[0] == 'image_data':
                     _, data_size, img_data, timing = response
                     if hasattr(self, '_take_function_context'):
@@ -6563,12 +6678,129 @@ class MainWindow(QMainWindow):
         except queue.Empty:
             pass
 
+    def publish_remote_result(self, operation, modality, result, context=None):
+        server = getattr(self, 'remote_control_server', None)
+        if server and server.started:
+            if context is not None and 'remote_origin' in context:
+                server.publish_result(operation, modality, result == 0x00,
+                                      origin=context['remote_origin'])
+            else:
+                # Legacy mocks/uncorrelated wire replies lack transaction IDs.
+                server.publish_result(operation, modality, result == 0x00)
+
+    def publish_remote_note(self, nid, status, message):
+        server = getattr(self, 'remote_control_server', None)
+        if server and server.started:
+            context = getattr(self, '_remote_note_context',
+                              getattr(self, 'active_command_context', None))
+            if context is not None and 'remote_origin' in context:
+                server.publish_note(nid, status, message, origin=context['remote_origin'])
+            else:
+                server.publish_note(nid, status, message)
+
+    def notify_remote_operation_start(self):
+        server = getattr(self, 'remote_control_server', None)
+        if server and server.started:
+            MainWindow.publish_remote_status_snapshot(self)
+            origin = MainWindow._submission_remote_origin(self)
+            if origin is _MISSING_REMOTE_ORIGIN:
+                server.new_operation()
+            else:
+                server.new_operation(origin=origin)
+
+    def _command_origin_valid(self, context, *, claim=False):
+        """Legacy/origin-less and explicit local contexts remain local best effort.
+
+        Authenticated origins never migrate to another session or stream. Local
+        origins do not require a paired session (or even a running server), but
+        a running replacement stream must not inherit the old stream's work.
+        A retry is NEW wire work: validate and claim atomically before I/O.
+        """
+        origin = context.get('remote_origin') if context else None
+        if not isinstance(origin, RemoteOrigin):
+            return True
+        server = getattr(self, 'remote_control_server', None)
+        if origin.session_token is None and not (isinstance(server, RemoteControlServer)
+                                                 and server.started):
+            return True
+        if not isinstance(server, RemoteControlServer):
+            return False
+        return (RemoteActionRequest(server, origin).claim() if claim
+                else server.origin_valid(origin))
+
+    def _pending_matches_context(self, context):
+        """Known contexts must match the submission sequence, never just MID."""
+        pending = getattr(self, 'pending_command', None)
+        pending_context = pending.get('context') if isinstance(pending, dict) else None
+        return bool(context and pending_context
+                    and context.get('sequence') is not None
+                    and context['sequence'] == pending_context.get('sequence')
+                    and context.get('msg_id') == pending.get('msg_id'))
+
+    def _retire_pending_command(self, pending, outcome):
+        """Release only this timeout and its owned download/OTA, not a replacement."""
+        if getattr(self, 'pending_command', None) is not pending:
+            return
+        timer = getattr(self, 'command_timeout_timer', None)
+        if timer:
+            timer.stop()
+        self.pending_command = None
+        context = pending.get('context')
+        if (context and context.get('sequence') is not None
+                and context['sequence'] != getattr(self, 'current_command_context_sequence', None)):
+            # Keep accepted wire context as a FIFO tombstone for a late reply;
+            # only its timeout is ours to retire, not the newer task's state.
+            return
+        perf = pending.get('download_perf')
+        if perf is not None and perf is getattr(self, 'download_perf', None):
+            self.is_downloading = False
+            self.end_download_performance(outcome)
+        ota_perf = pending.get('ota_perf')
+        if ota_perf is not None and ota_perf is getattr(self, 'ota_perf', None):
+            self.finish_ota(outcome)
+        MainWindow.publish_remote_status_snapshot(self)
+
+    def _reply_matches_current_task(self, context):
+        """Enforce captured provenance, not a transaction ID absent from the wire.
+
+        Legacy/no-context replies remain best effort. A known older submission or
+        retired sequence, however, must never drive the currently active task.
+        Local operations remain usable with a stopped/missing remote server.
+        """
+        if not context:
+            return True
+        sequence = context.get('sequence')
+        current_sequence = getattr(self, 'current_command_context_sequence',
+                                   getattr(self, 'command_context_sequence', None))
+        if sequence is not None and current_sequence is not None and sequence != current_sequence:
+            return False
+        contexts = getattr(self, 'command_contexts', None)
+        if (sequence is not None and isinstance(contexts, dict)
+                and context not in contexts.get(context.get('msg_id'), ())):
+            return False  # Already consumed or explicitly cleared on disconnect.
+        if ('sequence_generation' in context
+                and context['sequence_generation'] != getattr(self, 'sequence_generation', 0)):
+            return False
+        if not MainWindow._command_origin_valid(self, context):
+            # Only release the *same* revoked repeat. Superseded replies
+            # returned above cannot abort the replacement task's timers.
+            if (getattr(self, 'repeat_mode', False)
+                    and getattr(self, 'repeat_origin', _MISSING_REMOTE_ORIGIN) == context.get('remote_origin')):
+                MainWindow._abort_repeated_tasks(self)
+            return False
+        return True
+
     def handle_module_response(self, msg_id, data):
         """处理模组响应"""
         msg_type, result, payload = data[:3]
         command_context = data[3] if len(data) > 3 else None
         function_key = command_context.get('function_key') if command_context else None
-        if command_context and hasattr(self, '_discard_command_context'):
+        intermediate = (msg_type == 'reply' and result == 0x23
+                        and (function_key == 'recognize'
+                             or (not command_context and msg_id in ('0x12', '0x63', '0x81'))))
+        reply_matches_current_task = (msg_type != 'reply'
+                                      or MainWindow._reply_matches_current_task(self, command_context))
+        if command_context and msg_type == 'reply' and not intermediate and hasattr(self, '_discard_command_context'):
             self._discard_command_context(command_context)
 
         # 调试打印
@@ -6576,11 +6808,36 @@ class MainWindow(QMainWindow):
 
         # 处理Note消息
         if msg_id == 'note':
-            self.handle_note_message(payload)
+            previous = getattr(self, '_remote_note_context', _MISSING_REMOTE_ORIGIN)
+            self._remote_note_context = (command_context if len(data) > 3
+                                         else getattr(self, 'active_command_context', None))
+            try:
+                self.handle_note_message(payload)
+            finally:
+                if previous is _MISSING_REMOTE_ORIGIN:
+                    del self._remote_note_context
+                else:
+                    self._remote_note_context = previous
             return
 
         # 处理Reply消息
         if msg_type != 'reply':
+            return
+
+        if not reply_matches_current_task:
+            if (not intermediate and MainWindow._pending_matches_context(self, command_context)
+                    and not MainWindow._command_origin_valid(self, command_context)):
+                MainWindow._retire_pending_command(
+                    self, self.pending_command, '中止（原指令来源已失效）'
+                )
+            elapsed = (f'(耗时: {time.time() - command_context["sent_at"]:.2f}s)'
+                       if command_context.get('sent_at') is not None else '')
+            payload_text = ' '.join(f'{value:02X}' for value in payload) or '无'
+            self.append_module_log(
+                f'[历史指令回复] {function_key or msg_id} MID={msg_id}，'
+                f'结果码=0x{result:02X}，payload={payload_text} {elapsed} '
+                '(不推进当前任务)', success=(result == 0x00), error=(result != 0x00)
+            )
             return
 
         # 只在回复确实匹配待响应指令时停止其超时计时器。
@@ -6593,9 +6850,15 @@ class MainWindow(QMainWindow):
                 actual_msg_id = (command_context.get('msg_id') if command_context
                                  else int(msg_id, 16))
                 reply_matches_pending = actual_msg_id == pending_msg_id
+                pending_context = (self.pending_command.get('context')
+                                   if isinstance(self.pending_command, dict) else None)
+                if (command_context and pending_context
+                        and 'sequence' in command_context and 'sequence' in pending_context):
+                    reply_matches_pending = (reply_matches_pending
+                                             and command_context['sequence'] == pending_context['sequence'])
             except (ValueError, TypeError):
                 pass
-        if reply_matches_pending:
+        if reply_matches_pending and not intermediate:
             if self.command_timeout_timer and self.command_timeout_timer.isActive():
                 self.command_timeout_timer.stop()
             self.pending_command = None
@@ -6693,6 +6956,7 @@ class MainWindow(QMainWindow):
         elif ((function_key == 'register' and command_context
                and command_context.get('modality') == 'face')
               or (not command_context and msg_id == '0x1D')):  # 单帧注册
+            MainWindow.publish_remote_result(self, 'register', 'face', result, command_context)
             if result == 0x00:
                 # 注册成功，解析用户ID（紧跟result后面的2字节）
                 if len(payload) >= 2:
@@ -6701,15 +6965,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.append_module_log(f'注册成功 {elapsed_time}', success=True)
 
-                # 统计成功次数
-                if self.repeat_mode:
-                    self.repeat_success_count += 1
-
-                # 检查是否需要继续重复执行（传递成功状态）
-                self.check_repeat_next(last_success=True)
-
-                # 检查是否需要执行序列的下一步
-                self.check_sequence_next('人脸注册')
+                MainWindow._complete_repeat_operation(self, '人脸注册', True)
             else:
                 error_messages = {
                     0x01: '模组拒绝此命令',
@@ -6723,15 +6979,13 @@ class MainWindow(QMainWindow):
                 error_msg = error_messages.get(result, f'未知错误 (0x{result:02X})')
                 self.append_module_log(f'注册失败: {error_msg} {elapsed_time}', error=True)
 
-                # 检查是否需要继续重复执行（传递失败状态）
-                self.check_repeat_next(last_success=False)
-
-                # 注册失败也触发序列下一步（可根据需求修改）
-                self.check_sequence_next('人脸注册')
+                MainWindow._complete_repeat_operation(self, '人脸注册', False)
 
         elif ((function_key == 'recognize' and command_context
                and command_context.get('modality') == 'face')
               or (not command_context and msg_id == '0x12')):  # 人脸识别
+            if result != 0x23:
+                MainWindow.publish_remote_result(self, 'recognize', 'face', result, command_context)
             if result == 0x00:
                 # 识别成功，解析用户ID（紧跟result后面的2字节）
                 if len(payload) >= 2:
@@ -6740,15 +6994,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.append_module_log(f'识别成功 {elapsed_time}', success=True)
 
-                # 统计成功次数
-                if self.repeat_mode:
-                    self.repeat_success_count += 1
-
-                # 检查是否需要继续重复执行（传递成功状态）
-                self.check_repeat_next(last_success=True)
-
-                # 检查是否需要执行序列的下一步
-                self.check_sequence_next('识别D')
+                MainWindow._complete_repeat_operation(self, '识别D', True)
             elif result == 0x23:
                 self.append_module_log(f'palm switch {elapsed_time}', success=True)
                 # palm switch不触发重复逻辑
@@ -6770,11 +7016,7 @@ class MainWindow(QMainWindow):
                 error_msg = error_messages.get(result, f'未知错误 (0x{result:02X})')
                 self.append_module_log(f'识别失败: {error_msg} {elapsed_time}', error=True)
 
-                # 检查是否需要继续重复执行（传递失败状态）
-                self.check_repeat_next(last_success=False)
-
-                # 识别失败也触发序列下一步
-                self.check_sequence_next('识别D')
+                MainWindow._complete_repeat_operation(self, '识别D', False)
 
         elif function_key == 'set_baudrate':  # 业务流程发起的设置波特率
             payload_hex = payload.hex(' ').upper() if payload else '空'
@@ -6938,6 +7180,7 @@ class MainWindow(QMainWindow):
                and command_context.get('modality') == 'palm'
                and command_context.get('response_variant') == 'dsm')
               or (not command_context and msg_id == '0x62')):  # 手掌注册
+            MainWindow.publish_remote_result(self, 'register', 'palm', result, command_context)
             if result == 0x00:
                 # 注册成功，payload是用户ID（2字节）
                 if len(payload) >= 2:
@@ -6946,15 +7189,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.append_module_log(f'手掌注册成功 {elapsed_time}', success=True)
 
-                # 统计成功次数
-                if self.repeat_mode:
-                    self.repeat_success_count += 1
-
-                # 检查是否需要继续重复执行（传递成功状态）
-                self.check_repeat_next(last_success=True)
-
-                # 检查是否需要执行序列的下一步
-                self.check_sequence_next('手掌注册')
+                MainWindow._complete_repeat_operation(self, '手掌注册', True)
             else:
                 # 注册失败（错误码从十进制转换为十六进制）
                 error_messages = {
@@ -6967,16 +7202,14 @@ class MainWindow(QMainWindow):
                 error_msg = error_messages.get(result, f'未知错误 (0x{result:02X})')
                 self.append_module_log(f'手掌注册失败: {error_msg} {elapsed_time}', error=True)
 
-                # 检查是否需要继续重复执行（传递失败状态）
-                self.check_repeat_next(last_success=False)
-
-                # 注册失败也触发序列下一步
-                self.check_sequence_next('手掌注册')
+                MainWindow._complete_repeat_operation(self, '手掌注册', False)
 
         elif ((function_key == 'recognize' and command_context
                and command_context.get('modality') == 'palm'
                and command_context.get('response_variant') == 'dsm')
               or (not command_context and msg_id == '0x63')):  # 手掌识别
+            if result != 0x23:
+                MainWindow.publish_remote_result(self, 'recognize', 'palm', result, command_context)
             if result == 0x00:
                 # 识别成功，payload包含36字节：[用户ID 2字节][用户名 32字节][是否管理员 1字节][解锁状态 1字节]
                 if len(payload) >= 36:
@@ -6996,15 +7229,7 @@ class MainWindow(QMainWindow):
 
                     self.append_module_log(f'手掌识别成功 {elapsed_time}', success=True)
 
-                # 统计成功次数
-                if self.repeat_mode:
-                    self.repeat_success_count += 1
-
-                # 检查是否需要继续重复执行（传递成功状态）
-                self.check_repeat_next(last_success=True)
-
-                # 检查是否需要执行序列的下一步
-                self.check_sequence_next('识别K')
+                MainWindow._complete_repeat_operation(self, '识别K', True)
             elif result == 0x23:
                 self.append_module_log(f'palm switch {elapsed_time}', success=True)
                 # palm switch不触发重复逻辑
@@ -7032,11 +7257,7 @@ class MainWindow(QMainWindow):
                 error_msg = error_messages.get(result, f'未知错误 (0x{result:02X})')
                 self.append_module_log(f'手掌识别失败: {error_msg} {elapsed_time}', error=True)
 
-                # 检查是否需要继续重复执行（传递失败状态）
-                self.check_repeat_next(last_success=False)
-
-                # 识别失败也触发序列下一步
-                self.check_sequence_next('识别K')
+                MainWindow._complete_repeat_operation(self, '识别K', False)
 
         elif ((function_key == 'get_all_user_ids' and command_context
                and command_context.get('modality') == 'palm'
@@ -7140,6 +7361,7 @@ class MainWindow(QMainWindow):
                and command_context.get('modality') == 'palm'
                and command_context.get('response_variant') == 'kds')
               or (not command_context and msg_id == '0x80')):  # KDS手掌注册
+            MainWindow.publish_remote_result(self, 'register', 'palm', result, command_context)
             if result == 0x00:
                 # 注册成功，解析用户ID（紧跟result后面的2字节）
                 if len(payload) >= 2:
@@ -7148,20 +7370,18 @@ class MainWindow(QMainWindow):
                 else:
                     self.append_module_log(f'[KDS手掌注册] 注册成功 {elapsed_time}', success=True)
 
-                # 统计成功次数
-                if self.repeat_mode:
-                    self.repeat_success_count += 1
             else:
                 self.append_module_log(f'[KDS手掌注册] 注册失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
 
             # 检查是否需要继续重复执行，并推进自动序列。
-            self.check_repeat_next(last_success=(result == 0x00))
-            self.check_sequence_next('手掌注册')
+            MainWindow._complete_repeat_operation(self, '手掌注册', result == 0x00)
 
         elif ((function_key == 'recognize' and command_context
                and command_context.get('modality') == 'palm'
                and command_context.get('response_variant') == 'kds')
               or (not command_context and msg_id == '0x81')):  # KDS手掌识别
+            if result != 0x23:
+                MainWindow.publish_remote_result(self, 'recognize', 'palm', result, command_context)
             if result == 0x00:
                 # 识别成功，解析用户ID（紧跟result后面的2字节）
                 if len(payload) >= 2:
@@ -7170,9 +7390,6 @@ class MainWindow(QMainWindow):
                 else:
                     self.append_module_log(f'[KDS手掌识别] 识别成功 {elapsed_time}', success=True)
 
-                # 统计成功次数
-                if self.repeat_mode:
-                    self.repeat_success_count += 1
             elif result == 0x23:
                 self.append_module_log(f'palm switch {elapsed_time}', success=True)
             else:
@@ -7196,8 +7413,7 @@ class MainWindow(QMainWindow):
 
             # 检查是否需要继续重复执行，并推进自动序列。
             if result != 0x23:
-                self.check_repeat_next(last_success=(result == 0x00))
-                self.check_sequence_next('识别K')
+                MainWindow._complete_repeat_operation(self, '识别K', result == 0x00)
 
         elif ((function_key == 'delete_all' and command_context
                and command_context.get('modality') == 'palm'
@@ -7454,7 +7670,8 @@ class MainWindow(QMainWindow):
                 return
 
             # 判断是人脸还是手掌。自定义协议可通过发送上下文复用现有Note解析。
-            active_context = getattr(self, 'active_command_context', None)
+            active_context = getattr(self, '_remote_note_context',
+                                     getattr(self, 'active_command_context', None))
             note_variant = active_context.get('response_variant') if active_context else None
             note_modality = active_context.get('modality') if active_context else None
             if nid == 0x01:  # 人脸Note消息
@@ -7500,6 +7717,9 @@ class MainWindow(QMainWindow):
                 else:
                     self.append_module_log(f'[状态] {status_msg}')
 
+                # 发布到远程控制
+                self.publish_remote_note(nid, status, status_msg)
+
             elif nid == 0x08 or (note_modality == 'palm' and note_variant == 'dsm'):  # 手掌Note消息（DSM模式）
                 # 第1字节是0x04，第2字节是状态信息
                 status = data[1]
@@ -7538,6 +7758,9 @@ class MainWindow(QMainWindow):
 
                 status_msg = palm_status_messages.get(status, f'未知错误 (0x{status:02X})')
                 self.append_module_log(f'[手掌状态] {status_msg}')
+
+                # 发布到远程控制
+                self.publish_remote_note(nid, status, status_msg)
 
             elif nid == 0x04 or (note_modality == 'palm' and note_variant == 'kds'):  # 手掌Note消息（KDS模式）
                 # 第1字节是0x05，第2字节是状态信息
@@ -7578,6 +7801,9 @@ class MainWindow(QMainWindow):
                 status_msg = kds_palm_status_messages.get(status, f'未知错误 (0x{status:02X})')
                 self.append_module_log(f'[手掌状态] {status_msg}')
 
+                # 发布到远程控制
+                self.publish_remote_note(nid, status, status_msg)
+
             else:
                 self.append_module_log(f'[Note消息] 未知NID: 0x{nid:02X}')
         else:
@@ -7610,6 +7836,12 @@ class MainWindow(QMainWindow):
             'packet': bytes(packet),
             'sent_at': time.time(),
         }
+        if getattr(self, 'sequence_running', False):
+            context['sequence_generation'] = getattr(self, 'sequence_generation', 0)
+        origin = MainWindow._submission_remote_origin(self)
+        if origin is not _MISSING_REMOTE_ORIGIN:
+            context['remote_origin'] = origin
+        self.current_command_context_sequence = context['sequence']
         self.command_contexts.setdefault(msg_id, deque()).append(context)
         self.active_command_context = context
         return context
@@ -7626,6 +7858,13 @@ class MainWindow(QMainWindow):
         return context
 
     def _peek_command_context(self, msg_id):
+        """FIFO best-effort correlation: wire replies contain MID, not request IDs.
+
+        Captured provenance is enforceable, but a late/duplicate uncorrelated
+        reply with the same MID cannot be distinguished from a newer operation.
+        NOTE has no transaction ID either; its active-context association is
+        likewise best effort, not proof of which physical command produced it.
+        """
         contexts = self.command_contexts.get(msg_id)
         return contexts[0] if contexts else None
 
@@ -7695,8 +7934,15 @@ class MainWindow(QMainWindow):
         )
         if retry_context is not None:
             context['sequence'] = retry_context.get('sequence', context['sequence'])
+            self.current_command_context_sequence = context['sequence']
+            if 'sequence_generation' in retry_context:
+                context['sequence_generation'] = retry_context['sequence_generation']
+            if 'remote_origin' in retry_context:
+                context['remote_origin'] = retry_context['remote_origin']
         if not self.send_module_packet(packet, context):
             self._discard_command_context(context)
+            self._remote_send_failed = True
+            MainWindow._abort_repeated_tasks(self)
             return False
         return True
 
@@ -7759,6 +8005,8 @@ class MainWindow(QMainWindow):
                     context['custom_baudrate_target'] = target_baudrate
         if not self.send_module_packet(packet, context):
             self._discard_command_context(context)
+            self._remote_send_failed = True
+            MainWindow._abort_repeated_tasks(self)
             return False
         return True
 
@@ -7819,6 +8067,11 @@ class MainWindow(QMainWindow):
                 current_pending = self.pending_command
                 same_command = (isinstance(current_pending, dict)
                                 and current_pending.get('packet') == message)
+                previous_context = (current_pending.get('context')
+                                    if isinstance(current_pending, dict) else None)
+                if context and previous_context:
+                    same_command = (same_command
+                                    and context.get('sequence') == previous_context.get('sequence'))
                 if not same_command:
                     self.pending_command = {
                         'msg_id': msg_id,
@@ -7826,10 +8079,15 @@ class MainWindow(QMainWindow):
                         'context': dict(context) if context else None,
                         'function_key': function_key,
                         'retry_count': 0,
+                        'download_perf': getattr(self, 'download_perf', None),
+                        'ota_perf': getattr(self, 'ota_perf', None),
                     }
                 self.command_timeout_timer = QTimer()
                 self.command_timeout_timer.setSingleShot(True)
-                self.command_timeout_timer.timeout.connect(self.on_command_timeout)
+                timeout_pending = self.pending_command
+                self.command_timeout_timer.timeout.connect(
+                    lambda: self.on_command_timeout(timeout_pending)
+                )
                 self.command_timeout_timer.start(5000)
             return True
 
@@ -7842,12 +8100,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, '发送失败', f'发送指令失败:\n{e}')
             return False
 
-    def on_command_timeout(self):
-        """指令超时处理；重试完全相同的最终帧。"""
+    def on_command_timeout(self, expected_pending=None):
+        """Retry the exact frame, but claim its original origin as new wire work."""
         if not self.pending_command:
             return
 
         pending = self.pending_command
+        if expected_pending is not None and pending is not expected_pending:
+            return  # A queued timeout from an older timer cannot resend a replacement.
         # 兼容旧测试构造的元组。
         if not isinstance(pending, dict):
             msg_id, data, retry_count = pending
@@ -7864,6 +8124,10 @@ class MainWindow(QMainWindow):
         retry_count = pending['retry_count']
         function_key = pending.get('function_key')
         if retry_count < 3:
+            if not MainWindow._command_origin_valid(self, pending.get('context'), claim=True):
+                MainWindow._retire_pending_command(self, pending, '中止（原指令来源已失效）')
+                self.append_module_log('[超时] 原指令来源已失效，不再重传', error=True)
+                return
             retry_count += 1
             pending['retry_count'] = retry_count
             if getattr(self, 'download_perf', None):
@@ -7924,6 +8188,7 @@ class MainWindow(QMainWindow):
 
         if repeat_count > 1 and not self.repeat_mode:
             # 开始重复模式
+            self.repeat_origin = MainWindow._submission_remote_origin(self)
             self.repeat_mode = True
             self.repeat_current = 0
             self.repeat_total = repeat_count
@@ -7941,8 +8206,13 @@ class MainWindow(QMainWindow):
             self.repeat_reply_received = False  # 重置Reply接收标志
             self.append_module_log(f'[单帧注册] 第 {self.repeat_current}/{self.repeat_total} 次')
 
+        # 通知远程控制：新操作开始
+        self.notify_remote_operation_start()
+
         if not self.send_protocol_command('register', 'face'):
-            return
+            self._remote_send_failed = True
+            MainWindow._abort_repeated_tasks(self)
+            return False
 
         if not self.repeat_mode:
             self.append_module_log(
@@ -7956,6 +8226,7 @@ class MainWindow(QMainWindow):
 
         if repeat_count > 1 and not self.repeat_mode:
             # 开始重复模式
+            self.repeat_origin = MainWindow._submission_remote_origin(self)
             self.repeat_mode = True
             self.repeat_current = 0
             self.repeat_total = repeat_count
@@ -7973,8 +8244,13 @@ class MainWindow(QMainWindow):
             self.repeat_reply_received = False  # 重置Reply接收标志
             self.append_module_log(f'[人脸识别] 第 {self.repeat_current}/{self.repeat_total} 次')
 
+        # 通知远程控制：新操作开始
+        self.notify_remote_operation_start()
+
         if not self.send_protocol_command('recognize', 'face'):
-            return
+            self._remote_send_failed = True
+            MainWindow._abort_repeated_tasks(self)
+            return False
 
         if not self.repeat_mode:
             self.append_module_log(
@@ -7988,6 +8264,7 @@ class MainWindow(QMainWindow):
 
         if repeat_count > 1 and not self.repeat_mode:
             # 开始重复模式
+            self.repeat_origin = MainWindow._submission_remote_origin(self)
             self.repeat_mode = True
             self.repeat_current = 0
             self.repeat_total = repeat_count
@@ -8008,8 +8285,13 @@ class MainWindow(QMainWindow):
         if self.repeat_mode:
             self.append_module_log(f'[{mode_name}] 第 {self.repeat_current}/{self.repeat_total} 次')
 
+        # 通知远程控制：新操作开始
+        self.notify_remote_operation_start()
+
         if not self.send_protocol_command('register', 'palm'):
-            return
+            self._remote_send_failed = True
+            MainWindow._abort_repeated_tasks(self)
+            return False
 
         if not self.repeat_mode:
             self.append_module_log(f'[{mode_name}] 已发送注册指令，等待响应...')
@@ -8021,6 +8303,7 @@ class MainWindow(QMainWindow):
 
         if repeat_count > 1 and not self.repeat_mode:
             # 开始重复模式
+            self.repeat_origin = MainWindow._submission_remote_origin(self)
             self.repeat_mode = True
             self.repeat_current = 0
             self.repeat_total = repeat_count
@@ -8041,8 +8324,13 @@ class MainWindow(QMainWindow):
         if self.repeat_mode:
             self.append_module_log(f'[{mode_name}] 第 {self.repeat_current}/{self.repeat_total} 次')
 
+        # 通知远程控制：新操作开始
+        self.notify_remote_operation_start()
+
         if not self.send_protocol_command('recognize', 'palm'):
-            return
+            self._remote_send_failed = True
+            MainWindow._abort_repeated_tasks(self)
+            return False
 
         if not self.repeat_mode:
             self.append_module_log(f'[{mode_name}] 已发送识别指令，等待响应...')
@@ -8159,6 +8447,7 @@ class MainWindow(QMainWindow):
             self.repeat_current = 0
             self.repeat_total = 1
             self.repeat_command = None
+            self.repeat_origin = _MISSING_REMOTE_ORIGIN
             self.repeat_success_count = 0
             self.repeat_reply_received = False
             # 更新UI
@@ -8214,6 +8503,7 @@ class MainWindow(QMainWindow):
         if getattr(self, 'download_perf', None):
             self.end_download_performance('中止（开始新的下载）')
         self.download_perf = DownloadPerformance(image_type)
+        MainWindow.publish_remote_status_snapshot(self)
 
     def end_download_performance(self, outcome):
         self.set_download_polling(False)
@@ -8238,6 +8528,8 @@ class MainWindow(QMainWindow):
             self.pending_command = None
             if outcome.startswith('中止'):
                 self.append_module_log(f'[下载] {outcome}', error=True)
+
+        MainWindow.publish_remote_status_snapshot(self)
 
     def download_image(self):
         """下载JPEG图片（完整流程）"""
@@ -8580,6 +8872,7 @@ class MainWindow(QMainWindow):
         self.module_response_text.moveCursor(QTextCursor.End)
         if getattr(self, 'remote_control_server', None) and self.remote_control_server.started:
             self.remote_response_snapshot = self.module_response_text.toPlainText()[-20000:]
+            MainWindow.publish_remote_status_snapshot(self)
             self.remote_control_server.set_response_text(self.remote_response_snapshot)
 
     # === 自动执行序列相关方法 ===
@@ -8635,6 +8928,7 @@ class MainWindow(QMainWindow):
             self.append_module_log('[序列] 请先连接模组', error=True)
             return
 
+        self.sequence_generation = getattr(self, 'sequence_generation', 0) + 1
         self.sequence_running = True
         self.sequence_index = 0
         self.sequence_current_loop = 1
@@ -8647,6 +8941,7 @@ class MainWindow(QMainWindow):
 
     def stop_sequence(self):
         """停止自动执行序列"""
+        self.sequence_generation = getattr(self, 'sequence_generation', 0) + 1
         if self.sequence_running:
             self.sequence_running = False
             self.sequence_wait_response = None
@@ -8656,6 +8951,13 @@ class MainWindow(QMainWindow):
                     and not getattr(self, 'ota_in_progress', False):
                 self.protocol_task_profile_id = None
             self.append_module_log(f'[序列] 已停止执行序列（已完成 {self.sequence_current_loop - 1}/{self.sequence_total_loops} 次循环）', error=True)
+
+    def _schedule_sequence_step(self, delay):
+        generation = getattr(self, 'sequence_generation', 0)
+        def advance():
+            if generation == getattr(self, 'sequence_generation', 0):
+                self.execute_next_sequence_step()
+        QTimer.singleShot(delay, advance)
 
     def execute_next_sequence_step(self):
         """执行序列中的下一步操作"""
@@ -8670,7 +8972,7 @@ class MainWindow(QMainWindow):
                 self.sequence_index = 0
                 self.append_module_log(f'[序列] 第 {self.sequence_current_loop - 1} 轮循环完成，开始第 {self.sequence_current_loop} 轮循环', success=True)
                 # 延迟200ms后开始下一轮循环
-                QTimer.singleShot(200, self.execute_next_sequence_step)
+                MainWindow._schedule_sequence_step(self, 200)
                 return
             else:
                 # 所有循环完成
@@ -8734,7 +9036,7 @@ class MainWindow(QMainWindow):
         if self.sequence_running and self.sequence_wait_response == operation_type:
             self.sequence_wait_response = None
             # 延迟100ms后执行下一步，确保当前操作完全结束
-            QTimer.singleShot(100, self.execute_next_sequence_step)
+            MainWindow._schedule_sequence_step(self, 100)
 
     # ==============================
     # OTA升级相关方法
@@ -8802,6 +9104,8 @@ class MainWindow(QMainWindow):
             self.append_module_log(f'[OTA] {outcome}', error=True)
         elif outcome.startswith('升级完成'):
             self.append_module_log(f'[OTA] {outcome}', success=True)
+
+        MainWindow.publish_remote_status_snapshot(self)
 
     def record_ota_ack_timing(self, timing):
         perf = getattr(self, 'ota_perf', None)
@@ -8937,6 +9241,7 @@ class MainWindow(QMainWindow):
 
             # 开始OTA流程并锁定本次波特率策略。
             self.ota_in_progress = True
+            MainWindow.publish_remote_status_snapshot(self)
             self.ota_current_packet = 0
             self.ota_retry_count = 0
             self.ota_waiting_ack = False

@@ -4,6 +4,11 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
     <application
         android:icon="@mipmap/ic_launcher"
         android:theme="@style/Theme.CapLGRemote"
