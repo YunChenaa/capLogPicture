@@ -592,6 +592,8 @@ class ProtocolProfilesDialog(QDialog):
         self.editing_profile_id = None
         self.editors = {'face': {}, 'palm': {}}
         self.status_labels = {'face': {}, 'palm': {}}
+        self.skip_ota_header_checks = {}
+        self.ota_header_restore_buttons = {}
         self._loading = False
         self._build_ui()
         self._refresh_profile_list(current_profile_id)
@@ -634,7 +636,12 @@ class ProtocolProfilesDialog(QDialog):
 
         help_label = QLabel(
             '静态指令填写完整帧，例如 EF AA 30 00 00 30；动态指令保留完整帧结构并使用占位符。'
-            '每个字节以空格分隔，保存时验证长度和XOR校验。'
+            '每个字节以空格分隔，长度按数据区自动计算，数字为大端序，校验沿用XOR。\n'
+            'DATA_SIZE及OTA数字字段可指定1～8字节（如 {DATA_SIZE:3}）。'
+            '进入OTA/OTA头可按需使用 FILE_SIZE（文件字节数）、PACKET_COUNT（分包数量）、'
+            'PACKET_SIZE（配置单包大小）、{MD5_ASCII:32}；'
+            'OTA数据包必须包含 {FIRMWARE_DATA}，可选 PACKET_INDEX（从0开始）、'
+            'PACKET_LENGTH（当前固件块实际字节数）及上述元信息，字段顺序由模板决定。'
         )
         help_label.setWordWrap(True)
         help_label.setStyleSheet('background-color: #e3f2fd; padding: 8px; border-radius: 4px;')
@@ -698,6 +705,15 @@ class ProtocolProfilesDialog(QDialog):
             grid.addWidget(editor, row, 1)
             grid.addWidget(status, row, 2)
             grid.addWidget(restore, row, 3)
+            if function_key == 'ota_header':
+                skip = QCheckBox('跳过此步骤')
+                skip.setToolTip('跳过步骤3：进入OTA成功后直接发送固件数据包，保留当前OTA头模板')
+                skip.toggled.connect(
+                    lambda checked, m=modality: self._on_skip_ota_header_changed(m, checked)
+                )
+                self.skip_ota_header_checks[modality] = skip
+                self.ota_header_restore_buttons[modality] = restore
+                grid.addWidget(skip, row, 4)
 
         grid.setRowStretch(grid.rowCount(), 1)
         scroll.setWidget(content)
@@ -759,7 +775,17 @@ class ProtocolProfilesDialog(QDialog):
                 else:
                     status = '继承DSM'
                 self.status_labels[modality][function_key].setText(status)
+            skip = self.skip_ota_header_checks[modality]
+            skip.setEnabled(not builtin)
+            skip.setChecked(protocol_defs.ota_header_skipped(profile_id, modality, self.profiles))
+            self._on_skip_ota_header_changed(modality, skip.isChecked())
         self._loading = False
+
+    def _on_skip_ota_header_changed(self, modality, checked):
+        self.editors[modality]['ota_header'].setEnabled(not checked)
+        builtin = self.editing_profile_id in protocol_defs.BUILTIN_PROFILE_NAMES
+        self.ota_header_restore_buttons[modality].setEnabled(not builtin and not checked)
+        self._mark_dirty()
 
     def _on_profile_changed(self, current, previous):
         if self._loading or not current:
@@ -862,7 +888,9 @@ class ProtocolProfilesDialog(QDialog):
         if not profile:
             return
         profile['overrides'] = {'face': {}, 'palm': {}}
+        profile['skip_ota_header'] = {modality: False for modality in protocol_defs.MODALITIES}
         for modality in protocol_defs.MODALITIES:
+            self.skip_ota_header_checks[modality].setChecked(False)
             for function_key in protocol_defs.FUNCTION_SPECS:
                 editor = self.editors[modality][function_key]
                 editor.setText(protocol_defs.DSM_DEFAULTS[modality][function_key])
@@ -905,6 +933,10 @@ class ProtocolProfilesDialog(QDialog):
                     editor.setStyleSheet('')
             profile['name'] = name
             profile['overrides'] = overrides
+            profile['skip_ota_header'] = {
+                modality: self.skip_ota_header_checks[modality].isChecked()
+                for modality in protocol_defs.MODALITIES
+            }
         except (ValueError, protocol_defs.ProtocolTemplateError) as exc:
             if 'editor' in locals():
                 editor.setStyleSheet('border: 2px solid #d32f2f;')
@@ -2420,7 +2452,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle('串口日志采集工具 v1.0.1.1')
+        self.setWindowTitle('串口日志采集工具 v1.0.1.2')
         self.resize(1400, 800)
 
         # 串口相关
@@ -2479,6 +2511,9 @@ class MainWindow(QMainWindow):
         self.ota_in_progress = False  # 是否正在进行OTA
         self.ota_file_path = None  # OTA固件包路径
         self.ota_file_data = None  # OTA固件包数据
+        self.ota_metadata = None
+        self.ota_modality = None
+        self.ota_skip_header = False
         self.ota_packet_size = 4096  # 每包大小（默认4096字节）
         self.ota_total_packets = 0  # 总包数
         self.ota_current_packet = 0  # 当前发送的包序号
@@ -7500,15 +7535,20 @@ class MainWindow(QMainWindow):
                 print(f'[OTA调试] payload: {payload.hex().upper()}')
             if result == 0x00:
                 self.append_module_log(f'[OTA] 进入OTA状态成功 {elapsed_time}', success=True)
-                # 进入下一阶段：发送OTA header
                 if self.ota_in_progress and self.ota_stage == 2:
-                    self.ota_stage = 3
-                    self.schedule_ota_step(100, 3, self.send_ota_header)
+                    if self.ota_skip_header:
+                        self.append_module_log('[OTA] 步骤3: 跳过OTA header（协议组配置）')
+                        self.start_ota_packet_transfer()
+                    else:
+                        self.ota_stage = 3
+                        self.schedule_ota_step(100, 3, self.send_ota_header)
             else:
                 self.append_module_log(f'[OTA] 进入OTA状态失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
                 self.finish_ota('中止（进入OTA失败）')
 
         elif function_key == 'ota_header' or (not command_context and msg_id == '0x43'):  # OTA header
+            if self.ota_skip_header:
+                return
             print(f'[OTA调试] 收到0x43响应: result=0x{result:02X}, payload长度={len(payload)}')
             if len(payload) > 0:
                 print(f'[OTA调试] payload: {payload.hex().upper()}')
@@ -7516,10 +7556,7 @@ class MainWindow(QMainWindow):
                 self.append_module_log(f'[OTA] OTA header发送成功 {elapsed_time}', success=True)
                 # 进入下一阶段：发送固件包
                 if self.ota_in_progress and self.ota_stage == 3:
-                    self.ota_stage = 4
-                    self.ota_current_packet = 0
-                    self.set_download_polling(False)
-                    self.schedule_ota_step(100, 4, self.send_ota_packet)
+                    self.start_ota_packet_transfer()
             else:
                 self.append_module_log(f'[OTA] OTA header发送失败，结果码: 0x{result:02X} {elapsed_time}', error=True)
                 self.finish_ota('中止（header失败）')
@@ -9068,6 +9105,9 @@ class MainWindow(QMainWindow):
             # )
         self.ota_in_progress = False
         self.ota_stage = 0
+        self.ota_metadata = None
+        self.ota_modality = None
+        self.ota_skip_header = False
         if not getattr(self, 'is_downloading', False) \
                 and not getattr(self, 'repeat_mode', False) \
                 and not getattr(self, 'sequence_running', False):
@@ -9235,7 +9275,21 @@ class MainWindow(QMainWindow):
 
             # 获取配置
             self.ota_packet_size = self.ota_packet_size_spin.value()
-            self.ota_total_packets = (file_size + self.ota_packet_size - 1) // self.ota_packet_size
+            metadata = protocol_defs.build_ota_values(self.ota_file_data, self.ota_packet_size)
+            modality = self.current_operation_modality()
+            profile_id = self.protocol_task_profile_id or self.active_protocol_profile_id
+            skip_header = protocol_defs.ota_header_skipped(
+                profile_id, modality, self.protocol_profiles
+            )
+            protocol_defs.validate_ota_templates(
+                profile_id, modality, self.protocol_profiles, self.ota_file_data, metadata,
+                skip_header=skip_header,
+            )
+            self.ota_metadata = metadata
+            self.ota_modality = modality
+            self.ota_skip_header = skip_header
+            self.protocol_task_profile_id = profile_id
+            self.ota_total_packets = metadata['PACKET_COUNT']
 
             self.append_module_log(f'[OTA] 配置: 单包大小={self.ota_packet_size}字节, 总包数={self.ota_total_packets}')
 
@@ -9302,9 +9356,8 @@ class MainWindow(QMainWindow):
         if not self.ota_in_progress or self.ota_stage != 2:
             return
         self.append_module_log('[OTA] 步骤2: 进入OTA状态')
-        # 发送0x40指令进入OTA状态
-        print(f'[OTA调试] 发送0x40指令: EF AA 40 00 00 40')
-        if not self.send_protocol_command('ota_enter'):
+        if not self.send_protocol_command(
+                'ota_enter', modality=self.ota_modality, runtime_values=self.ota_metadata):
             self.finish_ota('中止（进入OTA指令发送失败）')
 
     def send_ota_header(self):
@@ -9312,60 +9365,30 @@ class MainWindow(QMainWindow):
         if not self.ota_in_progress or self.ota_stage != 3:
             return
         try:
-            import hashlib
-
             self.append_module_log('[OTA] 步骤3: 发送OTA header')
+            metadata = self.ota_metadata
+            self.append_module_log(
+                f'[OTA] 文件大小: {metadata["FILE_SIZE"]}, '
+                f'包数量: {metadata["PACKET_COUNT"]}, 单包大小: {metadata["PACKET_SIZE"]}'
+            )
+            self.append_module_log(f'[OTA] MD5: {metadata["MD5_ASCII"].decode("ascii")}')
 
-            file_size = len(self.ota_file_data)
-            packet_count = self.ota_total_packets
-            packet_size = self.ota_packet_size
-
-            # 计算MD5
-            md5_hash = hashlib.md5(self.ota_file_data).hexdigest()
-            # MD5要转换成32字节的ASCII字符串，而不是16字节的二进制
-            md5_bytes = md5_hash.encode('ascii')  # 32字节的ASCII字符串
-
-            self.append_module_log(f'[OTA] 文件大小: {file_size}, 包数量: {packet_count}, 单包大小: {packet_size}')
-            self.append_module_log(f'[OTA] MD5: {md5_hash}')
-
-            # 打印MD5详细信息
-            print(f'[OTA调试] MD5字符串: {md5_hash}')
-            print(f'[OTA调试] MD5字节数: {len(md5_bytes)}')
-            md5_hex = ' '.join([f'{b:02X}' for b in md5_bytes])
-            print(f'[OTA调试] MD5十六进制(ASCII): {md5_hex}')
-
-            # 构建header数据
-            # 包大小（4字节，大端序）
-            data = file_size.to_bytes(4, byteorder='big')
-            print(f'[OTA调试] 文件大小(4字节): {" ".join([f"{b:02X}" for b in data])} = {file_size}')
-
-            # 分包数量（4字节，大端序）
-            data += packet_count.to_bytes(4, byteorder='big')
-            print(f'[OTA调试] 包数量(4字节): {" ".join([f"{b:02X}" for b in packet_count.to_bytes(4, byteorder="big")])} = {packet_count}')
-
-            # 单包大小（2字节，大端序）
-            data += packet_size.to_bytes(2, byteorder='big')
-            print(f'[OTA调试] 单包大小(2字节): {" ".join([f"{b:02X}" for b in packet_size.to_bytes(2, byteorder="big")])} = {packet_size}')
-
-            # 文件校验位（32字节，MD5的ASCII字符串形式）
-            data += md5_bytes
-
-            # 打印完整header
-            hex_data = ' '.join([f'{b:02X}' for b in data])
-            print(f'[OTA调试] 完整header数据(42字节): {hex_data}')
-            print(f'[OTA调试] Header数据长度: {len(data)}字节')
-
-            if not self.send_protocol_command('ota_header', runtime_values={
-                    'FILE_SIZE': file_size,
-                    'PACKET_COUNT': packet_count,
-                    'PACKET_SIZE': packet_size,
-                    'MD5_ASCII': md5_bytes,
-            }):
+            if not self.send_protocol_command(
+                    'ota_header', modality=self.ota_modality, runtime_values=metadata):
                 self.finish_ota('中止（header发送失败）')
 
         except Exception as e:
             self.append_module_log(f'[OTA] 发送header失败: {e}', error=True)
             self.finish_ota('中止（header发送失败）')
+
+    def start_ota_packet_transfer(self):
+        """进入固件包阶段，供OTA头成功和跳过OTA头共用。"""
+        if not self.ota_in_progress or self.ota_stage not in (2, 3):
+            return
+        self.ota_stage = 4
+        self.ota_current_packet = 0
+        self.set_download_polling(False)
+        self.schedule_ota_step(100, 4, self.send_ota_packet)
 
     def send_ota_packet(self):
         """发送OTA固件包"""
@@ -9382,32 +9405,17 @@ class MainWindow(QMainWindow):
                     perf.add('ACK处理至下一包（含间隔）', build_started - perf.handled_at)
                     perf.handled_at = None
 
-            # 计算当前包的偏移和大小
-            offset = self.ota_current_packet * self.ota_packet_size
-            remaining = len(self.ota_file_data) - offset
-            current_packet_size = min(self.ota_packet_size, remaining)
-
-            # 提取当前包的数据
-            packet_data = self.ota_file_data[offset:offset + current_packet_size]
-
-            # 构建44指令的数据部分
-            # 包序（2字节，大端序）
-            data = self.ota_current_packet.to_bytes(2, byteorder='big')
-            # 包长（2字节，大端序）
-            data += current_packet_size.to_bytes(2, byteorder='big')
-            # 包内容
-            data += packet_data
+            values = protocol_defs.ota_packet_values(
+                self.ota_file_data, self.ota_metadata, self.ota_current_packet
+            )
 
             if perf:
                 perf.add('固件分包构造', time.perf_counter() - build_started)
                 perf.request_started = time.perf_counter()
             self.ota_waiting_ack = True
             # 发送失败后不启动本包超时重传
-            if not self.send_protocol_command('ota_packet', runtime_values={
-                    'PACKET_INDEX': self.ota_current_packet,
-                    'PACKET_LENGTH': current_packet_size,
-                    'FIRMWARE_DATA': packet_data,
-            }):
+            if not self.send_protocol_command(
+                    'ota_packet', modality=self.ota_modality, runtime_values=values):
                 self.finish_ota('中止（固件包发送失败）')
                 return
 
@@ -9474,7 +9482,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName('capLG')
-    app.setApplicationVersion('1.0.1.1')
+    app.setApplicationVersion('1.0.1.2')
     icon_name = 'AppIcon.png'
     if getattr(sys, 'frozen', False):
         icon_path = os.path.join(sys._MEIPASS, 'resources', icon_name)

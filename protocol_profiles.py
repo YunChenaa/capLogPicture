@@ -1,6 +1,7 @@
 """模组协议组、完整帧模板校验与渲染。"""
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
 import re
 import uuid
 
@@ -14,6 +15,14 @@ MODALITIES = ('face', 'palm')
 class FunctionSpec:
     label: str
     required_placeholders: tuple = ()
+    optional_placeholders: tuple = ()
+
+
+OTA_METADATA = ('FILE_SIZE', 'PACKET_COUNT', 'PACKET_SIZE', 'MD5_ASCII')
+VARIABLE_WIDTH_PLACEHOLDERS = {
+    'DATA_SIZE', 'FILE_SIZE', 'PACKET_COUNT', 'PACKET_SIZE',
+    'PACKET_INDEX', 'PACKET_LENGTH',
+}
 
 
 FUNCTION_SPECS = {
@@ -33,12 +42,11 @@ FUNCTION_SPECS = {
     'get_jpeg_size': FunctionSpec('获取JPEG大小'),
     'get_raw_size': FunctionSpec('获取RAW大小'),
     'image_upload': FunctionSpec('下载图片分段', ('OFFSET', 'SIZE')),
-    'ota_enter': FunctionSpec('进入OTA'),
-    'ota_header': FunctionSpec(
-        '发送OTA头', ('FILE_SIZE', 'PACKET_COUNT', 'PACKET_SIZE', 'MD5_ASCII')
-    ),
+    'ota_enter': FunctionSpec('进入OTA', optional_placeholders=OTA_METADATA),
+    'ota_header': FunctionSpec('发送OTA头', optional_placeholders=OTA_METADATA),
     'ota_packet': FunctionSpec(
-        '发送OTA数据包', ('PACKET_INDEX', 'PACKET_LENGTH', 'FIRMWARE_DATA')
+        '发送OTA数据包', ('FIRMWARE_DATA',),
+        OTA_METADATA + ('PACKET_INDEX', 'PACKET_LENGTH')
     ),
 }
 
@@ -66,16 +74,18 @@ class ProtocolTemplateError(ValueError):
     """完整帧或帧模板不符合固定线协议。"""
 
 
-def build_packet(msg_id, data=b''):
-    """按 EF AA + MID + 大端长度 + data + XOR 构建完整帧。"""
+def build_packet(msg_id, data=b'', data_size_width=2):
+    """按 EF AA + MID + 模板指定的大端长度 + data + XOR 构建完整帧。"""
     if not 0 <= int(msg_id) <= 0xFF:
         raise ProtocolTemplateError('消息ID必须在00到FF之间')
+    if not isinstance(data_size_width, int) or not 1 <= data_size_width <= 8:
+        raise ProtocolTemplateError('DATA_SIZE宽度必须为1到8字节')
     data = bytes(data)
-    if len(data) > 0xFFFF:
-        raise ProtocolTemplateError('data长度超过65535字节')
-    size = len(data).to_bytes(2, 'big')
-    checksum = int(msg_id) ^ size[0] ^ size[1]
-    for value in data:
+    if len(data) >= 1 << (8 * data_size_width):
+        raise ProtocolTemplateError(f'DATA_SIZE超出{data_size_width}字节无符号整数范围')
+    size = len(data).to_bytes(data_size_width, 'big')
+    checksum = int(msg_id)
+    for value in size + data:
         checksum ^= value
     return b'\xEF\xAA' + bytes([int(msg_id)]) + size + data + bytes([checksum])
 
@@ -169,14 +179,17 @@ def _parse_token(token):
         raise ProtocolTemplateError(f'未知占位符 {{{name}}}')
     supplied_width = int(match.group(2)) if match.group(2) else None
     expected_width = PLACEHOLDER_WIDTHS[name]
-    if expected_width is None:
+    if name in VARIABLE_WIDTH_PLACEHOLDERS:
+        if supplied_width is None or not 1 <= supplied_width <= 8:
+            raise ProtocolTemplateError(f'占位符 {{{name}}}必须指定1到8字节宽度，如 {{{name}:{expected_width}}}')
+    elif expected_width is None:
         if supplied_width is not None:
             raise ProtocolTemplateError(f'占位符 {{{name}}}不应指定宽度')
     elif supplied_width != expected_width:
         raise ProtocolTemplateError(
             f'占位符 {{{name}}}必须写为 {{{name}:{expected_width}}}'
         )
-    canonical = f'{{{name}:{expected_width}}}' if expected_width is not None else f'{{{name}}}'
+    canonical = f'{{{name}:{supplied_width}}}' if supplied_width is not None else f'{{{name}}}'
     return ('placeholder', canonical, name)
 
 
@@ -192,24 +205,26 @@ def normalize_template(template, function_key):
     tokens = [item[1] for item in parsed]
     placeholders = [item[2] for item in parsed if item[0] == 'placeholder']
 
-    if len(tokens) < 6:
+    dynamic = bool(placeholders)
+    if len(tokens) < (5 if dynamic else 6):
         raise ProtocolTemplateError('完整帧至少应包含同步头、MID、长度和校验')
     if tokens[:2] != ['EF', 'AA']:
         raise ProtocolTemplateError('同步头必须为 EF AA')
     if parsed[2][0] != 'byte':
         raise ProtocolTemplateError('msgID必须是两位十六进制字节')
 
-    required = set(FUNCTION_SPECS[function_key].required_placeholders)
-    dynamic = bool(placeholders)
+    spec = FUNCTION_SPECS[function_key]
+    required = set(spec.required_placeholders)
+    optional = set(spec.optional_placeholders)
     if dynamic:
-        if tokens[3] != '{DATA_SIZE:2}':
-            raise ProtocolTemplateError('动态模板的dataSize必须写为 {DATA_SIZE:2}')
+        if parsed[3][2] != 'DATA_SIZE':
+            raise ProtocolTemplateError('动态模板的MID后必须为 {DATA_SIZE:字节数}')
         if tokens[-1] != '{CHECKSUM}':
             raise ProtocolTemplateError('动态模板必须以 {CHECKSUM} 结尾')
         if placeholders.count('DATA_SIZE') != 1 or placeholders.count('CHECKSUM') != 1:
             raise ProtocolTemplateError('DATA_SIZE和CHECKSUM各只能出现一次')
         data_placeholders = set(placeholders) - {'DATA_SIZE', 'CHECKSUM'}
-        allowed = required
+        allowed = required | optional
         unexpected = data_placeholders - allowed
         missing = required - data_placeholders
         if unexpected:
@@ -218,9 +233,9 @@ def normalize_template(template, function_key):
         if missing:
             names = '、'.join(sorted(missing))
             raise ProtocolTemplateError(f'缺少动态占位符：{names}')
-        for name in required:
+        for name in data_placeholders:
             if placeholders.count(name) != 1:
-                raise ProtocolTemplateError(f'占位符 {{{name}}}必须且只能出现一次')
+                raise ProtocolTemplateError(f'占位符 {{{name}}}只能出现一次')
     else:
         if required:
             names = '、'.join(sorted(required))
@@ -244,8 +259,8 @@ def normalize_template(template, function_key):
     return ' '.join(tokens)
 
 
-def _runtime_bytes(name, value):
-    width = PLACEHOLDER_WIDTHS[name]
+def _runtime_bytes(name, value, width=None):
+    width = PLACEHOLDER_WIDTHS[name] if width is None else width
     if name == 'FIRMWARE_DATA':
         if not isinstance(value, (bytes, bytearray, memoryview)):
             raise ProtocolTemplateError('FIRMWARE_DATA必须是字节数据')
@@ -288,9 +303,62 @@ def render_template(template, function_key, runtime_values=None):
         name = parsed[2]
         if name not in values:
             raise ProtocolTemplateError(f'缺少运行时数据：{name}')
-        data.extend(_runtime_bytes(name, values[name]))
+        width = _PLACEHOLDER_RE.match(token).group(2)
+        data.extend(_runtime_bytes(name, values[name], int(width) if width else None))
 
-    return build_packet(int(tokens[2], 16), data)
+    data_size_width = int(_PLACEHOLDER_RE.match(tokens[3]).group(2))
+    return build_packet(int(tokens[2], 16), data, data_size_width)
+
+
+def build_ota_values(firmware, packet_size):
+    """从实际固件和分包配置计算所有OTA阶段共用的元信息。"""
+    if not isinstance(firmware, (bytes, bytearray, memoryview)) or not firmware:
+        raise ProtocolTemplateError('固件包必须是非空字节数据')
+    if not isinstance(packet_size, int) or packet_size <= 0:
+        raise ProtocolTemplateError('OTA单包大小必须为正整数')
+    firmware = bytes(firmware)
+    return {
+        'FILE_SIZE': len(firmware),
+        'PACKET_SIZE': packet_size,
+        'PACKET_COUNT': (len(firmware) + packet_size - 1) // packet_size,
+        'MD5_ASCII': hashlib.md5(firmware).hexdigest().encode('ascii'),
+    }
+
+
+def ota_packet_values(firmware, metadata, packet_index):
+    """填充当前包序、实际包长与固件内容；重传使用相同数据。"""
+    if not isinstance(packet_index, int) or not 0 <= packet_index < metadata['PACKET_COUNT']:
+        raise ProtocolTemplateError('OTA包序超出固件分包范围')
+    firmware = bytes(firmware)
+    offset = packet_index * metadata['PACKET_SIZE']
+    data = firmware[offset:offset + metadata['PACKET_SIZE']]
+    return {
+        **metadata,
+        'PACKET_INDEX': packet_index,
+        'PACKET_LENGTH': len(data),
+        'FIRMWARE_DATA': data,
+    }
+
+
+def validate_ota_templates(profile_id, modality, custom_profiles, firmware, metadata,
+                           skip_header=False):
+    """发送任何升级指令前校验元信息、最大包序和最大实际数据区。"""
+    last_index = metadata['PACKET_COUNT'] - 1
+    largest_packet = ota_packet_values(firmware, metadata, 0)
+    largest_packet['PACKET_INDEX'] = last_index
+    stages = (
+        ('ota_enter', metadata),
+        ('ota_header', metadata),
+        ('ota_packet', largest_packet),
+        ('ota_packet', ota_packet_values(firmware, metadata, last_index)),
+    )
+    for function_key, values in stages:
+        if function_key == 'ota_header' and skip_header:
+            continue
+        try:
+            resolve_packet(profile_id, modality, function_key, custom_profiles, values)
+        except ProtocolTemplateError as exc:
+            raise ProtocolTemplateError(f'{FUNCTION_SPECS[function_key].label}: {exc}') from exc
 
 
 def profile_exists(profile_id, custom_profiles):
@@ -323,6 +391,19 @@ def effective_templates(profile_id, modality, custom_profiles):
             result.update(profile.get('overrides', {}).get(modality, {}))
             return result
     return result
+
+
+def ota_header_skipped(profile_id, modality, custom_profiles):
+    """返回某模态是否跳过OTA头；内置组与旧配置默认不跳过。"""
+    if modality not in MODALITIES:
+        raise KeyError(f'未知模态：{modality}')
+    if profile_id in BUILTIN_PROFILE_NAMES:
+        return False
+    for profile in custom_profiles:
+        if profile.get('id') == profile_id:
+            values = profile.get('skip_ota_header', {})
+            return isinstance(values, dict) and values.get(modality) is True
+    return False
 
 
 def resolve_packet(profile_id, modality, function_key, custom_profiles, runtime_values=None):
@@ -421,7 +502,21 @@ def sanitize_custom_profiles(raw_profiles):
                     errors.append(
                         f'协议组“{name}”{modality}/{function_key}无效（{exc}），已回退DSM'
                     )
-        clean.append({'id': profile_id, 'name': name, 'overrides': overrides})
+        skip_header = {modality: False for modality in MODALITIES}
+        raw_skip_header = raw.get('skip_ota_header', {})
+        if not isinstance(raw_skip_header, dict):
+            errors.append(f'协议组“{name}”的OTA头跳过设置无效，已恢复发送OTA头')
+            raw_skip_header = {}
+        for modality in MODALITIES:
+            value = raw_skip_header.get(modality, False)
+            if not isinstance(value, bool):
+                errors.append(f'协议组“{name}”的{modality} OTA头跳过设置无效，已恢复发送OTA头')
+                continue
+            skip_header[modality] = value
+        clean.append({
+            'id': profile_id, 'name': name, 'overrides': overrides,
+            'skip_ota_header': skip_header,
+        })
         used_ids.add(profile_id)
         used_names.add(name.casefold())
     return clean, errors
@@ -440,6 +535,10 @@ def new_profile(name='新协议组', source_profile_id=PROFILE_DSM, custom_profi
         'id': f'custom-{uuid.uuid4().hex}',
         'name': name,
         'overrides': overrides,
+        'skip_ota_header': {
+            modality: ota_header_skipped(source_profile_id, modality, custom_profiles)
+            for modality in MODALITIES
+        },
     }
 
 
