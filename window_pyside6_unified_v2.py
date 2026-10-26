@@ -2792,6 +2792,16 @@ class MainWindow(QMainWindow):
 
         log_tool_layout.addStretch()
 
+        self.btn_log_latest = QPushButton('↓')
+        self.btn_log_latest.setFixedWidth(36)
+        self.btn_log_latest.setToolTip('回到最新日志并恢复自动滚动')
+        self.btn_log_latest.setAccessibleName('回到最新日志')
+        self.btn_log_latest.clicked.connect(self.scroll_to_latest_log)
+        log_tool_layout.addWidget(self.btn_log_latest)
+        self.btn_log_latest.hide()
+        self.log_text.verticalScrollBar().valueChanged.connect(self.update_log_latest_button)
+        self.log_text.verticalScrollBar().rangeChanged.connect(self.update_log_latest_button)
+
         self.log_count_label = QLabel('日志行数: 0')
         self.log_count_label.setStyleSheet('color: #666666; font-size: 9pt;')
         log_tool_layout.addWidget(self.log_count_label)
@@ -4984,14 +4994,35 @@ class MainWindow(QMainWindow):
             pos = end
         cursor.insertText(text[pos:] + '\n', formats['text'])
 
-    def append_logs(self, lines, scroll_to_end=True):
-        """批量插入；迭代器可在每行渲染后检查预算，未消费的日志留在队列。"""
+    def update_log_latest_button(self, *args):
+        """离开底部时显示返回按钮，不占用额外的日志显示高度。"""
+        scrollbar = self.log_text.verticalScrollBar()
+        self.btn_log_latest.setVisible(
+            self.log_history_marker_id is None and scrollbar.value() < scrollbar.maximum()
+        )
+
+    def scroll_to_latest_log(self):
+        """回到底部；后续实时日志继续自动跟随。"""
+        self.log_text.moveCursor(QTextCursor.End)
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self.update_log_latest_button()
+
+    def append_logs(self, lines, scroll_to_end=None):
+        """批量插入；默认仅在原本位于底部时自动跟随新日志。"""
         lines = iter(lines)
         try:
             first_line = next(lines)
         except StopIteration:
             return
 
+        scrollbar = self.log_text.verticalScrollBar()
+        if scroll_to_end is None:
+            scroll_to_end = scrollbar.value() >= scrollbar.maximum()
+        # 用文档光标锚定顶部内容，窗口达到行数上限并裁剪旧行时也不跳动。
+        top_cursor = self.log_text.cursorForPosition(QPoint(0, 0))
+        top_offset = self.log_text.cursorRect(top_cursor).top()
+        horizontal_value = self.log_text.horizontalScrollBar().value()
         formats = self.get_log_formats()
         cursor = QTextCursor(self.log_text.document())
         cursor.movePosition(QTextCursor.End)
@@ -5012,6 +5043,11 @@ class MainWindow(QMainWindow):
                 self.log_count_label.setText(f'日志行数: {len(full_log_cache)}')
                 if scroll_to_end:
                     self.log_text.moveCursor(QTextCursor.End)
+                    scrollbar.setValue(scrollbar.maximum())
+                else:
+                    scrollbar.setValue(scrollbar.value()
+                                       + self.log_text.cursorRect(top_cursor).top() - top_offset)
+                    self.log_text.horizontalScrollBar().setValue(horizontal_value)
             finally:
                 self.log_text.setUpdatesEnabled(updates_enabled)
 
@@ -6670,6 +6706,16 @@ class MainWindow(QMainWindow):
                     # Reply消息: ('reply', msg_id, result, payload)
                     _, msg_id, result, payload = response[:4]
                     context = self._peek_command_context(msg_id) if hasattr(self, '_peek_command_context') else None
+                    switched_contexts = MainWindow._palm_switch_reply_candidates(self, msg_id)
+                    if switched_contexts and (context or len(switched_contexts) > 1):
+                        self.append_module_log(
+                            f'[识别回复冲突] MID=0x{msg_id:02X}同时存在手掌切换或独立指令，'
+                            '无法确定归属，不推进当前任务', error=True
+                        )
+                        continue
+                    switched_palm = bool(switched_contexts)
+                    if switched_palm:
+                        context = switched_contexts[0]
                     function_key = context.get('function_key') if context else None
                     if ((function_key == 'ota_packet' or (not context and msg_id == 0x44))
                             and len(response) > 4 and getattr(self, 'ota_perf', None)):
@@ -6694,9 +6740,12 @@ class MainWindow(QMainWindow):
                         canonical_id = protocol_defs.canonical_response_mid(
                             function_key, context['profile_id'], context['modality']
                         )
-                    self.module_response_signal.emit(
-                        f'0x{canonical_id:02X}', ('reply', result, payload, context)
-                    )
+                    reply = ('reply', result, payload, context)
+                    if switched_palm:
+                        canonical_id = 0x63
+                        reply += ({'modality': 'palm', 'response_variant': 'dsm',
+                                   'wire_mid': msg_id},)
+                    self.module_response_signal.emit(f'0x{canonical_id:02X}', reply)
                 elif response[0] == 'note':
                     # Note消息: ('note', data)
                     _, data = response
@@ -6830,9 +6879,16 @@ class MainWindow(QMainWindow):
         msg_type, result, payload = data[:3]
         command_context = data[3] if len(data) > 3 else None
         function_key = command_context.get('function_key') if command_context else None
+        response_info = data[4] if len(data) > 4 else {}
+        response_modality = (response_info.get('modality')
+                             or (command_context.get('modality') if command_context else None))
+        response_variant = (response_info.get('response_variant')
+                            or (command_context.get('response_variant') if command_context else None))
         intermediate = (msg_type == 'reply' and result == 0x23
                         and (function_key == 'recognize'
                              or (not command_context and msg_id in ('0x12', '0x63', '0x81'))))
+        if intermediate and command_context:
+            MainWindow._mark_palm_switch_context(self, command_context)
         reply_matches_current_task = (msg_type != 'reply'
                                       or MainWindow._reply_matches_current_task(self, command_context))
         if command_context and msg_type == 'reply' and not intermediate and hasattr(self, '_discard_command_context'):
@@ -7017,7 +7073,7 @@ class MainWindow(QMainWindow):
                 MainWindow._complete_repeat_operation(self, '人脸注册', False)
 
         elif ((function_key == 'recognize' and command_context
-               and command_context.get('modality') == 'face')
+               and response_modality == 'face')
               or (not command_context and msg_id == '0x12')):  # 人脸识别
             if result != 0x23:
                 MainWindow.publish_remote_result(self, 'recognize', 'face', result, command_context)
@@ -7240,9 +7296,11 @@ class MainWindow(QMainWindow):
                 MainWindow._complete_repeat_operation(self, '手掌注册', False)
 
         elif ((function_key == 'recognize' and command_context
-               and command_context.get('modality') == 'palm'
-               and command_context.get('response_variant') == 'dsm')
+               and response_modality == 'palm'
+               and response_variant == 'dsm')
               or (not command_context and msg_id == '0x63')):  # 手掌识别
+            operation_type = ('识别D' if command_context and command_context.get('modality') == 'face'
+                              else '识别K')
             if result != 0x23:
                 MainWindow.publish_remote_result(self, 'recognize', 'palm', result, command_context)
             if result == 0x00:
@@ -7264,7 +7322,7 @@ class MainWindow(QMainWindow):
 
                     self.append_module_log(f'手掌识别成功 {elapsed_time}', success=True)
 
-                MainWindow._complete_repeat_operation(self, '识别K', True)
+                MainWindow._complete_repeat_operation(self, operation_type, True)
             elif result == 0x23:
                 self.append_module_log(f'palm switch {elapsed_time}', success=True)
                 # palm switch不触发重复逻辑
@@ -7292,7 +7350,7 @@ class MainWindow(QMainWindow):
                 error_msg = error_messages.get(result, f'未知错误 (0x{result:02X})')
                 self.append_module_log(f'手掌识别失败: {error_msg} {elapsed_time}', error=True)
 
-                MainWindow._complete_repeat_operation(self, '识别K', False)
+                MainWindow._complete_repeat_operation(self, operation_type, False)
 
         elif ((function_key == 'get_all_user_ids' and command_context
                and command_context.get('modality') == 'palm'
@@ -7904,6 +7962,30 @@ class MainWindow(QMainWindow):
         """
         contexts = self.command_contexts.get(msg_id)
         return contexts[0] if contexts else None
+
+    def _mark_palm_switch_context(self, context):
+        if (not context or context.get('function_key') != 'recognize'
+                or context.get('modality') != 'face'
+                or context.get('response_variant') != 'dsm'
+                or context.get('profile_id') == protocol_defs.PROFILE_KDS):
+            return
+        if context not in getattr(self, 'command_contexts', {}).get(context.get('msg_id'), ()):
+            return
+        templates = protocol_defs.effective_templates(
+            context['profile_id'], 'palm', self.protocol_profiles
+        )
+        palm_mid = int(templates['recognize'].split()[2], 16)
+        if palm_mid != context['msg_id']:
+            context['palm_switch_mid'] = palm_mid
+
+    def _palm_switch_reply_candidates(self, msg_id):
+        """Only a marked FIFO head can own the cross-MID palm result."""
+        return [
+            contexts[0]
+            for contexts in getattr(self, 'command_contexts', {}).values()
+            if contexts and contexts[0].get('function_key') == 'recognize'
+            and contexts[0].get('palm_switch_mid') == msg_id
+        ]
 
     def _take_function_context(self, function_key):
         """移除最早的指定语义上下文（用于无MID的图片数据响应）。"""
